@@ -63,6 +63,20 @@ def rating_order(label: str) -> tuple[int, int, str]:
     return (3, 0, s)
 
 
+def display_rating_order(label: str) -> tuple[int, int, str]:
+    """Export layout order: S3 10/15/25%, S2, S1 (no missing curves invented)."""
+    rating = normalize_rating(label).upper()
+    m = re.search(r"(\d+)\s*%", rating)
+    if rating.startswith('S3') and m:
+        return 0, int(m.group(1)), rating
+    if rating.startswith('S2'):
+        minutes = re.search(r'S2\s*(\d+)', rating)
+        return 1, int(minutes.group(1)) if minutes else 0, rating
+    if rating.startswith('S1'):
+        return 2, 0, rating
+    return 3, 0, rating
+
+
 def tidy_rows(rows: list[dict]) -> tuple[list[dict], list[str]]:
     clean = []
     errors = []
@@ -296,56 +310,113 @@ def generate_excel(rows: list[dict], model_name: str, max_rpm: int = 20000,
             ir += 1
         row_map[key] = (first, ir)
 
-    sh_grid.merge_range(0, 0, 1, min(len(groups)*2, 14), f"{model_name} | 주축 회전수별 출력/토크 계산표", fmt_title)
-    sh_grid.write("A4", "최대 RPM")
-    sh_grid.write_number("B4", max_rpm)
-    sh_grid.write("C4", "간격")
-    sh_grid.write_number("D4", step)
-    sh_grid.write("E4", "절환 RPM(선택)")
-    if switch_rpm is not None:
-        sh_grid.write_number("F4", switch_rpm)
-    else:
-        sh_grid.write("F4", "미지정")
-    sh_grid.write("A6", "실선 = 출력(kW), 점선 = 토크(N·m). 원본 데이터 범위 밖 RPM은 공백으로 유지합니다.")
-    sh_grid.write(6, 0, "Motor speed", fmt_sub)
-    sh_grid.write(7, 0, "RPM", fmt_head)
-    sh_grid.set_column(0, 0, 16)
-    sh_grid.freeze_panes(8, 1)
-    series_meta = []
-    for i, (key, pts) in enumerate(groups.items()):
-        col_p, col_t = i*2 + 1, i*2 + 2
-        sh_grid.merge_range(6, col_p, 6, col_t, f"{key[0]} | {key[1]}", fmt_sub)
-        sh_grid.write(7, col_p, "출력 (kW)", fmt_head)
-        sh_grid.write(7, col_t, "토크 (N·m)", fmt_head)
-        sh_grid.set_column(col_p, col_t, 17)
-        series_meta.append((key, col_p, col_t))
+    # RPM table is grouped by winding, then by physical quantity:
+    # LOW Power (all ratings) | LOW Torque (all ratings) | HIGH Power | HIGH Torque.
+    # Within every quantity group: S3 10%, S3 15%, S3 25%, S2, S1.
+    # Only ratings actually supplied by the catalog are represented.
+    by_winding = {}
+    for key in groups:
+        by_winding.setdefault(key[0], []).append(key)
+    winding_names = sorted(by_winding, key=lambda w: (w != 'LOW', w != 'HIGH', w))
+    for w in winding_names:
+        by_winding[w].sort(key=lambda key: display_rating_order(key[1]))
 
-    anchor_rpms = {r["RPM"] for r in rows}
-    last_row = 8 + len(grid)
+    # columns: (winding, rating, power col, torque col); position is set per quantity block.
+    series_meta = []
+    blocks = []
+    next_col = 1
+    for index, w in enumerate(winding_names):
+        keys = by_winding[w]
+        power_begin = next_col
+        power_cols = {}
+        for key in keys:
+            power_cols[key] = next_col
+            next_col += 1
+        torque_begin = next_col
+        torque_cols = {}
+        for key in keys:
+            torque_cols[key] = next_col
+            next_col += 1
+        winding_end = next_col - 1
+        blocks.append((w, power_begin, torque_begin, winding_end, keys))
+        for key in keys:
+            series_meta.append((key, power_cols[key], torque_cols[key]))
+        if index < len(winding_names) - 1:
+            next_col += 1  # visible separator between LOW and HIGH
+
+    final_col = max(1, next_col - 1)
+    sh_grid.merge_range(0, 0, 1, final_col,
+                        f"{model_name} | 회전수별 출력·토크 계산표", fmt_title)
+    sh_grid.write('A4', '최대 RPM')
+    sh_grid.write_number('B4', max_rpm)
+    sh_grid.write('C4', '계산 간격')
+    sh_grid.write_number('D4', step)
+    sh_grid.write('E4', '절환 RPM')
+    sh_grid.write('F4', switch_rpm if switch_rpm is not None else '미지정')
+    sh_grid.merge_range(5, 0, 5, final_col,
+                        '각 권선은 출력(kW)을 먼저 모으고 다음에 토크(N·m)를 모았습니다. 기준점 밖은 공란이며 임의 외삽하지 않습니다.', fmt_txt)
+    sh_grid.merge_range(6, 0, 7, 0, '주축 회전수', fmt_sub)
+    sh_grid.write(8, 0, 'RPM', fmt_head)
+    sh_grid.set_column(0, 0, 17)
+    sh_grid.freeze_panes(9, 1)
+    fmt_low = wb.add_format({'bold': True, 'font_color': 'white', 'bg_color': low_color, 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#FFFFFF'})
+    fmt_high = wb.add_format({'bold': True, 'font_color': 'white', 'bg_color': high_color, 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#FFFFFF'})
+    fmt_power_group = wb.add_format({'bold': True, 'font_color': '#1D4ED8', 'bg_color': '#DBEAFE', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#BACCE9'})
+    fmt_torque_group = wb.add_format({'bold': True, 'font_color': '#9A3412', 'bg_color': '#FFEDD5', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#F7C9A2'})
+    fmt_condition_kw = wb.add_format({'bold': True, 'font_color': '#1E40AF', 'bg_color': '#EFF6FF', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#CCD9EA', 'text_wrap': True})
+    fmt_condition_nm = wb.add_format({'bold': True, 'font_color': '#9A3412', 'bg_color': '#FFF7ED', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#F2D4B5', 'text_wrap': True})
+    sh_grid.set_row(6, 25)
+    sh_grid.set_row(7, 25)
+    sh_grid.set_row(8, 36)
+
+    for w, pstart, tstart, end, keys in blocks:
+        heading = fmt_low if w == 'LOW' else fmt_high
+        sh_grid.merge_range(6, pstart, 6, end, f'{w} 권선', heading)
+        if len(keys) > 1:
+            sh_grid.merge_range(7, pstart, 7, tstart - 1, '출력 (kW)', fmt_power_group)
+            sh_grid.merge_range(7, tstart, 7, end, '토크 (N·m)', fmt_torque_group)
+        else:
+            sh_grid.write(7, pstart, '출력 (kW)', fmt_power_group)
+            sh_grid.write(7, tstart, '토크 (N·m)', fmt_torque_group)
+        for idx, key in enumerate(keys):
+            # Column order: e.g. S3/S6 10%, S3/S6 15%, S3/S6 25%, S2 15min, S1 Cont.
+            sh_grid.write(8, pstart + idx, key[1], fmt_condition_kw)
+            sh_grid.write(8, tstart + idx, key[1], fmt_condition_nm)
+        sh_grid.set_column(pstart, end, 17)
+
+    if len(blocks) > 1:
+        for left, right in zip(blocks, blocks[1:]):
+            spacer_col = left[3] + 1
+            sh_grid.set_column(spacer_col, spacer_col, 3.5)
+
+    anchor_rpms = {r['RPM'] for r in rows}
     for n, rpm in enumerate(grid):
-        excel_row = n + 9
-        sh_grid.write_number(8+n, 0, rpm, fmt_break if rpm in anchor_rpms else fmt_rpm)
+        excel_row = n + 10  # Excel row 10 is first computed speed row
+        sh_grid.write_number(9+n, 0, rpm, fmt_break if rpm in anchor_rpms else fmt_rpm)
         for key, col_p, col_t in series_meta:
             source_points = groups[key]
-            p, t = calc_at(source_points, rpm)
+            p_value, t_value = calc_at(source_points, rpm)
             a_start, a_end = row_map[key]
-            formula = _excel_formula(f"$A{excel_row}", a_start, a_end)
-            sh_grid.write_formula(8+n, col_p, formula, fmt_power, p if p is not None else "")
-            # At rpm=0, respect a provided torque point (otherwise leave blank).
-            zero_t = next((number(pt.get("토크(N·m)")) for pt in source_points if pt["RPM"] == 0), None)
+            formula = _excel_formula(f'$A{excel_row}', a_start, a_end)
+            sh_grid.write_formula(9+n, col_p, formula, fmt_power, p_value if p_value is not None else '')
+            zero_t = next((number(pt.get('토크(N·m)')) for pt in source_points if pt['RPM'] == 0), None)
+            p_cell = _a1(col_p, excel_row)
             if zero_t is not None:
-                tq = f'=IF($A{excel_row}=0,{zero_t},IF(ISNUMBER({_a1(col_p, excel_row)}),{_a1(col_p, excel_row)}*{RPM_TO_TORQUE}/$A{excel_row},""))'
+                tq = f'=IF($A{excel_row}=0,{zero_t},IF(ISNUMBER({p_cell}),{p_cell}*{RPM_TO_TORQUE}/$A{excel_row},""))'
             else:
-                tq = f'=IF($A{excel_row}=0,"",IF(ISNUMBER({_a1(col_p, excel_row)}),{_a1(col_p, excel_row)}*{RPM_TO_TORQUE}/$A{excel_row},""))'
-            sh_grid.write_formula(8+n, col_t, tq, fmt_torque, t if t is not None else "")
-    sh_grid.autofilter(7, 0, 7+len(grid), 0)
+                tq = f'=IF($A{excel_row}=0,"",IF(ISNUMBER({p_cell}),{p_cell}*{RPM_TO_TORQUE}/$A{excel_row},""))'
+            sh_grid.write_formula(9+n, col_t, tq, fmt_torque, t_value if t_value is not None else '')
+    sh_grid.autofilter(8, 0, 8 + len(grid), 0)
 
     chart = wb.add_chart({"type": "scatter", "subtype": "straight"})
     for i, (key, col_p, col_t) in enumerate(series_meta):
         color = ["#DA3D2C", "#2563EB", "#16A34A", "#C0841A", "#9333EA", "#0284C7", "#DB2777"][i % 7]
         first_anchor, last_anchor = groups[key][0]["RPM"], groups[key][-1]["RPM"]
-        first_chart_row = 8 + grid.index(first_anchor)
-        last_chart_row = 8 + grid.index(last_anchor)
+        visible = [i for i, rpm in enumerate(grid) if first_anchor <= rpm <= last_anchor]
+        if not visible:
+            continue
+        first_chart_row = 9 + visible[0]
+        last_chart_row = 9 + visible[-1]
         for col, tag, y2, dash in ((col_p, "kW", True, "solid"), (col_t, "N·m", False, "dash")):
             chart.add_series({"name": f"{key[0]} {key[1]} · {tag}",
                 "categories": ["RPM 계산표", first_chart_row, 0, last_chart_row, 0],
@@ -375,7 +446,8 @@ def generate_excel(rows: list[dict], model_name: str, max_rpm: int = 20000,
         "계산 방법: 기준점 사이에서는 출력(kW)을 선형 보간하고 T(N·m) = 9549.2965855 × P(kW) / rpm으로 토크를 계산합니다.",
         "카탈로그에 출력/토크가 둘 다 있더라도 반올림으로 다를 수 있으므로 출력(kW)을 기준으로 계산합니다. G열 오차를 확인하십시오.",
         "원본 기준점의 최소/최대 RPM을 벗어나는 값은 임의로 외삽하지 않고 비웁니다.",
-        "RPM 계산표의 초록/파랑 등 숫자는 수식으로 작성되므로 Excel에서 원본 출력값을 수정하면 재계산됩니다.",
+        "RPM 계산표는 LOW 출력→LOW 토크→HIGH 출력→HIGH 토크 순서이며 정격 조건은 S3 10%, S3 15%, S3 25%, S2, S1 순입니다. 없는 정격은 생성하지 않습니다.",
+        "RPM 계산표의 파랑/갈색 숫자는 수식으로 작성되므로 Excel에서 원본 출력값을 수정하면 재계산됩니다.",
         "원본 행 추가/삭제 또는 정격별 데이터 행 수 변경 시에는 앱에서 재생성하는 것이 안전합니다.",
         "LOW/HIGH 권선이 함께 포함되지만 자동 절환 구간은 카탈로그 자료만으로 확정하지 않습니다.",
         "저장된 엑셀은 로컬 파일이며, 사용자 확인 없이 모터 성능을 보증하는 자료로 사용하지 마십시오.",
