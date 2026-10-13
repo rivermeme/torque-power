@@ -449,7 +449,7 @@ def generate_excel(rows: list[dict], model_name: str, max_rpm: int = 20000,
     sh_support.set_column(1, len(chart_curves), 22)
 
 
-    dark = HW_DARK
+    dark = UI_DARK_BLUE
     low_color, high_color = "#7a7a7a", "#2453ff"
     fmt_title = wb.add_format({"font_color": "white", "bold": True, "font_size": 17, "bg_color": dark, "valign": "vcenter"})
     fmt_head = wb.add_format({"bg_color": dark, "font_color": "#FFFFFF", "bold": True,
@@ -772,93 +772,108 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 
-HW_BLUE = "#0054A6"
-HW_DARK = "#003E7E"
-HW_MID = "#1E66B3"
-HW_LIGHT = "#EAF2FB"
-HW_BORDER = "#C9D9EE"
-HW_LOGO_BASE64 = "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"
+# Readability-focused interface theme. Motor analysis logic is unchanged.
+UI_DARK_BLUE = "#164879"
 
 
-def inject_brand_styles():
+def apply_ui_styles():
     st.markdown(
         """
-    <style>
-    .stApp {
-        background: linear-gradient(180deg, #f6f8fc 0%, #ffffff 180px, #f7f9fc 100%);
-    }
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #f4f7fb 0%, #eef4fb 100%);
-        border-right: 1px solid #C9D9EE;
-    }
-    .hw-header {
-        display:flex; align-items:center; gap:18px; padding:18px 20px; margin: 0 0 10px 0;
-        border:1px solid #C9D9EE; border-radius:18px;
-        background: linear-gradient(135deg, #ffffff 0%, #f2f7fd 100%);
-        box-shadow: 0 10px 24px rgba(0, 71, 145, 0.08);
-    }
-    .hw-logo-wrap {
-        flex:0 0 auto; width:120px; min-width:120px; display:flex; justify-content:center; align-items:center;
-        background:#fff; border:1px solid #d8e4f3; border-radius:14px; padding:12px 10px;
-    }
-    .hw-logo-wrap img { width:100%; height:auto; display:block; }
-    .hw-title-wrap { flex:1 1 auto; }
-    .hw-kicker { color:#0054A6; font-size:0.82rem; font-weight:800; letter-spacing:0.08em; text-transform:uppercase; margin-bottom:2px; }
-    .hw-main-title { color:#17324d; font-size:2.05rem; font-weight:900; line-height:1.2; margin:0; }
-    .hw-sub-title { color:#56728f; font-size:0.98rem; margin-top:6px; }
-    .hw-chip {
-        display:inline-block; margin-top:10px; padding:6px 10px; border-radius:999px;
-        background:#EAF2FB; color:#003E7E; font-weight:700; font-size:0.85rem; border:1px solid #C9D9EE;
-    }
-    div[data-testid="stMetric"] {
-        background:#ffffff; border:1px solid #C9D9EE; border-radius:14px; padding:10px 12px;
-        box-shadow: 0 6px 18px rgba(0,71,145,0.05);
-    }
-    div[data-testid="stMetric"] label, div[data-testid="stMetric"] [data-testid="stMetricLabel"] { color:#4f6780; }
-    div[data-testid="stMetric"] [data-testid="stMetricValue"] { color:#003E7E; }
-    .stButton > button, .stDownloadButton > button {
-        border-radius: 12px; border: 1px solid #0f4f96; background: linear-gradient(180deg, #0f5cb2 0%, #004b97 100%);
-        color: #ffffff; font-weight: 700;
-    }
-    .stButton > button:hover, .stDownloadButton > button:hover {
-        border-color:#003e7e; background: linear-gradient(180deg, #1567c3 0%, #0050a0 100%); color:#ffffff;
-    }
-    .stTextInput input, .stNumberInput input, .stTextArea textarea, div[data-baseweb="select"] > div {
-        border-radius: 10px !important; border-color:#c7d7eb !important;
-    }
-    button[role="tab"] {
-        border-radius: 12px 12px 0 0; border:1px solid #d3dfef; background:#f2f6fb; color:#42617d; font-weight:700;
-        padding: 10px 16px;
-    }
-    button[role="tab"][aria-selected="true"] {
-        background: linear-gradient(180deg, #0f5cb2 0%, #004b97 100%); color:#fff; border-color:#004b97;
-    }
-    div[data-testid="stExpander"] { border:1px solid #dbe6f2; border-radius:14px; background:#fff; }
-    [data-testid="stDataFrame"] { border:1px solid #e1e9f3; border-radius:12px; overflow:hidden; }
-    </style>
+        <style>
+        /* Neutral, readable internal-tool UI; retains Streamlit's functionality. */
+        .stApp {
+            background: #F7F9FC;
+        }
+        section[data-testid="stSidebar"] {
+            background: #F2F5F9;
+            border-right: 1px solid #DAE2EC;
+        }
+        /* Clean section headings and subtle divider. */
+        h1, h2, h3 { letter-spacing: -0.025em; }
+        h1 { color: #142B46 !important; }
+        h2, h3 { color: #1D3653 !important; }
+        /* Progress metrics: white cards with high-contrast values. */
+        [data-testid="stMetric"] {
+            background: #FFFFFF;
+            border: 1px solid #D8E1EC;
+            border-radius: 10px;
+            padding: 12px 14px;
+        }
+        [data-testid="stMetricValue"] { color: #163C68 !important; }
+        [data-testid="stMetricLabel"] { color: #465D75 !important; }
+        /* Filled primary actions only; secondary actions remain legible on white. */
+        .stButton button[kind="primary"],
+        .stDownloadButton button[kind="primary"] {
+            background-color: #15599B !important;
+            border: 1px solid #15599B !important;
+            color: white !important;
+            border-radius: 8px;
+            font-weight: 650;
+        }
+        .stButton button[kind="primary"]:hover,
+        .stDownloadButton button[kind="primary"]:hover {
+            background-color: #0E477E !important;
+            border-color: #0E477E !important;
+            color: #FFFFFF !important;
+        }
+        .stButton button[kind="secondary"],
+        .stDownloadButton button[kind="secondary"] {
+            background: #FFFFFF !important;
+            border: 1px solid #9BAFC4 !important;
+            color: #183D65 !important;
+            border-radius: 8px;
+            font-weight: 600;
+        }
+        .stButton button[kind="secondary"]:hover,
+        .stDownloadButton button[kind="secondary"]:hover {
+            background: #EBF3FB !important;
+            border-color: #15599B !important;
+            color: #123D68 !important;
+        }
+        /* Consistent disabled state instead of white-on-pale-blue. */
+        .stButton button:disabled,
+        .stDownloadButton button:disabled {
+            background: #E9EEF4 !important;
+            border-color: #D1DAE4 !important;
+            color: #657588 !important;
+            opacity: 1 !important;
+        }
+        /* Tabs use underline rather than dark filled tiles. */
+        button[role="tab"] {
+            background: transparent !important;
+            color: #455B72 !important;
+            border-radius: 0 !important;
+            font-weight: 600;
+            border-bottom: 2px solid transparent;
+        }
+        button[role="tab"][aria-selected="true"] {
+            color: #124F8E !important;
+            border-bottom: 3px solid #15599B !important;
+            font-weight: 750;
+        }
+        button[role="tab"]:hover {
+            color: #124F8E !important;
+            background: #EDF3FA !important;
+        }
+        /* Input borders and data tables. */
+        .stTextInput input, .stNumberInput input, .stTextArea textarea {
+            border-color: #B8C6D7 !important;
+            border-radius: 7px;
+        }
+        [data-testid="stDataFrame"] {
+            border: 1px solid #DCE4ED;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        [data-testid="stExpander"] {
+            border-color: #DAE2EC;
+            border-radius: 9px;
+        }
+        </style>
         """,
         unsafe_allow_html=True,
     )
 
-
-def render_brand_header(title: str, subtitle: str, chip: str | None = None):
-    chip_html = f'<div class="hw-chip">{chip}</div>' if chip else ''
-    st.markdown(
-        f"""
-        <div class="hw-header">
-            <div class="hw-logo-wrap">
-                <img src="data:image/png;base64,{HW_LOGO_BASE64}" alt="HWACHEON logo" />
-            </div>
-            <div class="hw-title-wrap">
-                <div class="hw-kicker">HWACHEON · SPINDLE PERFORMANCE</div>
-                <h1 class="hw-main-title">{title}</h1>
-                <div class="hw-sub-title">{subtitle}</div>
-                {chip_html}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 SYSTEM_PROMPT = """
 You are a technical transcription assistant for industrial motor PERFORMANCE TABLES.
@@ -1285,11 +1300,11 @@ if st.session_state.pending_identity:
         st.session_state[key] = value
     st.session_state.pending_identity = None
 
-inject_brand_styles()
+apply_ui_styles()
 
 app_password = secret("APP_PASSWORD")
 if app_password and not st.session_state.get("authenticated", False):
-    render_brand_header(APP_TITLE, "화천 브랜드 스타일이 적용된 스핀들 성능 분석 플랫폼", "보안 접속이 필요합니다")
+    st.title(APP_TITLE)
     attempt = st.text_input("앱 접속 비밀번호", type="password")
     if st.button("접속", type="primary"):
         if attempt == app_password:
@@ -1301,7 +1316,6 @@ if app_password and not st.session_state.get("authenticated", False):
 
 with st.sidebar:
     st.markdown("### ⚙️ 설정 및 저장 내역")
-    st.image(base64.b64decode(HW_LOGO_BASE64), width=160)
     with st.expander("AI 이미지 인식 설정", expanded=False):
         api_key = st.text_input("Gemini API 키", value=secret("GEMINI_API_KEY"),
                                 type="password", help="Streamlit Secrets 설정을 권장합니다.")
@@ -1367,8 +1381,7 @@ with st.sidebar:
             st.caption("영구 저장을 원하면 별도 Private GitHub 저장소 연동이 필요합니다.")
     st.caption("서버 임시 저장은 재배포 후 사라질 수 있습니다. JSON 백업 또는 GitHub 저장을 이용하세요.")
 
-render_brand_header(APP_TITLE, "회사명 · 모델명 · 전압 → 사진 AI 인식 → 원본 그래프 확인 → 권선절환 포인트 설정 → 엑셀", "HWACHEON Design Edition")
-st.caption("화천 로고와 블루 톤을 적용한 브랜드형 UI입니다. 기능은 기존과 동일합니다.")
+st.title(APP_TITLE)
 
 # 상단 고정 진행 상태. 업로드 파일 접수, AI 인식, 데이터 저장은 각각 별개의 상태입니다.
 files_at_top = list(st.session_state.get('motor_catalog_images') or []) + clipboard_files()
@@ -1379,8 +1392,7 @@ top_recognized = bool(top_uploaded and current_upload_sig == st.session_state.re
 top_rows = bool(st.session_state.rows)
 top_saved = bool(st.session_state.saved_signature)
 with st.container(border=True):
-    st.markdown('**진행 현황 — HWACHEON 스타일 대시보드**  \
-사진 등록, AI 인식, 데이터 검토, 저장 상태를 단계별로 확인합니다.')
+    st.markdown("**진행 현황**")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric('① 사진 등록', f'{len(files_at_top)}장 완료' if top_uploaded else '등록 대기')
     c2.metric('② AI 인식', '완료' if top_recognized else ('재인식 필요' if top_uploaded and top_rows and st.session_state.data_origin == 'AI 인식' else '실행 대기'))
@@ -1752,7 +1764,6 @@ with step_review:
 
 with step_plot:
     st.subheader("③ 출력·토크 통합 선도")
-    st.caption("화천 스타일 화면 테마를 적용했으며, 그래프 계산 로직은 기존과 동일합니다.")
     if not valid:
         st.info("먼저 ①에서 사진을 등록하고 ②에서 데이터를 확인하세요.")
     else:
