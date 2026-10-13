@@ -1,0 +1,1588 @@
+"""Standalone Streamlit app for motor specs, switching curves, Excel exports.
+Run: streamlit run "torque power app.py"
+No motor_core.py dependency: calculation and Excel code is included here.
+"""
+from __future__ import annotations
+
+import base64
+import io
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from streamlit_paste_button import paste_image_button
+import requests
+import streamlit as st
+
+
+# ------------------------------------------------------------------
+# Internal motor calculation and Excel module.
+# Kept INSIDE this file to avoid version mismatches between
+# torque power app.py and motor_core.py in GitHub deployments.
+# Do not import motor_core.py: it is intentionally not required.
+# ------------------------------------------------------------------
+import io
+import math
+import re
+from collections import defaultdict
+from typing import Any
+
+import plotly.graph_objects as go
+import xlsxwriter
+
+RPM_TO_TORQUE = 9549.296585513721  # P[kW] = T[Nm] * rpm / this value.
+
+# Plot colors inspired by the user's reference image.
+LOW_POWER_COLORS = {
+    "S3_10": "#a92323",
+    "S3_15": "#7f7f7f",
+    "S3_25": "#8f8f8f",
+    "S2": "#9b9b9b",
+    "S1": "#6f6f6f",
+    "OTHER": "#7f7f7f",
+}
+LOW_TORQUE_COLORS = {
+    "S3_10": "#cf0000",
+    "S3_15": "#8d8d8d",
+    "S3_25": "#8a8a8a",
+    "S2": "#7f7f7f",
+    "S1": "#d10000",
+    "OTHER": "#8f8f8f",
+}
+HIGH_POWER_COLORS = {
+    "S3_10": "#1b36d9",
+    "S3_15": "#2346e0",
+    "S3_25": "#1237ff",
+    "S2": "#7d7d7d",
+    "S1": "#183cff",
+    "OTHER": "#2850f0",
+}
+HIGH_TORQUE_COLORS = {
+    "S3_10": "#c40000",
+    "S3_15": "#cf4c4c",
+    "S3_25": "#e52525",
+    "S2": "#8f8f8f",
+    "S1": "#d10c0c",
+    "OTHER": "#d13d3d",
+}
+
+
+def number(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        v = float(str(value).replace(",", "").strip())
+        return v if math.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_winding(value: str) -> str:
+    s = str(value or "").strip().upper()
+    if "LOW" in s or s in {"L", "저속", "저속권선"}:
+        return "LOW"
+    if "HIGH" in s or s in {"H", "고속", "고속권선"}:
+        return "HIGH"
+    return s or "LOW"
+
+
+def normalize_rating(value: str) -> str:
+    s = re.sub(r"\s+", " ", str(value or "S1").strip())
+    upper = s.upper()
+    if upper.startswith("S1"):
+        return "S1 Cont."
+    m = re.search(r"S2\s*([0-9]+)\s*MIN", upper)
+    if m:
+        return f"S2 {m.group(1)}min"
+    m = re.search(r"S3\s*/\s*S6\s*([0-9]+)\s*%", upper)
+    if m:
+        return f"S3/S6 {m.group(1)}%"
+    return s or "S1 Cont."
+
+
+def rating_order(label: str) -> tuple[int, int, str]:
+    s = label.upper()
+    if s.startswith("S1"):
+        return (0, 0, s)
+    if s.startswith("S2"):
+        return (1, 0, s)
+    m = re.search(r"(\d+)\s*%", s)
+    if m:
+        return (2, -int(m.group(1)), s)
+    return (3, 0, s)
+
+
+def display_rating_order(label: str) -> tuple[int, int, str]:
+    """Export layout order: S3 10/15/25%, S2, S1 (no missing curves invented)."""
+    rating = normalize_rating(label).upper()
+    m = re.search(r"(\d+)\s*%", rating)
+    if rating.startswith('S3') and m:
+        return 0, int(m.group(1)), rating
+    if rating.startswith('S2'):
+        minutes = re.search(r'S2\s*(\d+)', rating)
+        return 1, int(minutes.group(1)) if minutes else 0, rating
+    if rating.startswith('S1'):
+        return 2, 0, rating
+    return 3, 0, rating
+
+
+def rating_bucket(label: str) -> str:
+    rating = normalize_rating(label).upper()
+    if rating.startswith("S1"):
+        return "S1"
+    if rating.startswith("S2"):
+        return "S2"
+    m = re.search(r"(\d+)\s*%", rating)
+    if rating.startswith("S3") and m:
+        return f"S3_{m.group(1)}"
+    return re.sub(r"[^A-Z0-9]+", "_", rating)
+
+
+def bucket_order(bucket: str) -> tuple[int, int, str]:
+    if bucket.startswith("S3_"):
+        try:
+            return 0, int(bucket.split("_", 1)[1]), bucket
+        except Exception:
+            return 0, 999, bucket
+    if bucket == "S2":
+        return 1, 0, bucket
+    if bucket == "S1":
+        return 2, 0, bucket
+    return 3, 0, bucket
+
+
+def bucket_display(bucket: str, representative: str | None = None) -> str:
+    if representative:
+        return normalize_rating(representative)
+    if bucket == "S1":
+        return "S1 Cont."
+    if bucket == "S2":
+        return "S2"
+    if bucket.startswith("S3_"):
+        return f"S3/S6 {bucket.split('_', 1)[1]}%"
+    return bucket.replace("_", " ")
+
+
+def tidy_rows(rows: list[dict]) -> tuple[list[dict], list[str]]:
+    clean = []
+    errors = []
+    for i, row in enumerate(rows, 1):
+        w = normalize_winding(row.get("권선", "LOW"))
+        rating = normalize_rating(row.get("운전조건", "S1"))
+        rpm = number(row.get("RPM"))
+        kw = number(row.get("출력(kW)"))
+        nm = number(row.get("토크(N·m)"))
+        if rpm is None and kw is None and nm is None:
+            continue
+        if rpm is None or rpm < 0:
+            errors.append(f"{i}행: RPM이 없거나 음수입니다.")
+            continue
+        if (kw is None and nm is None) or (kw is not None and kw < 0) or (nm is not None and nm < 0):
+            errors.append(f"{i}행: 출력/토크 값을 확인하십시오.")
+            continue
+        if rpm == 0 and kw is None:
+            kw = 0.0
+        clean.append({"권선": w, "운전조건": rating, "RPM": rpm,
+                      "출력(kW)": kw, "토크(N·m)": nm})
+    clean.sort(key=lambda d: (0 if d["권선"] == "LOW" else 1, d["권선"], rating_order(d["운전조건"]), d["RPM"]))
+    seen = set()
+    unique = []
+    for row in clean:
+        k = (row["권선"], row["운전조건"], row["RPM"])
+        if k in seen:
+            errors.append(f"중복 기준점: {k}")
+            continue
+        seen.add(k)
+        unique.append(row)
+    for row in unique:
+        rpm, kw, nm = row["RPM"], row["출력(kW)"], row["토크(N·m)"]
+        if rpm > 0 and kw is not None and nm is not None:
+            derived = nm * rpm / RPM_TO_TORQUE
+            if kw > .1 and abs(derived - kw) / kw > .1:
+                errors.append(
+                    f"{row['권선']} {row['운전조건']} {rpm:g}rpm: "
+                    f"출력 {kw:g}kW / 토크 {nm:g}N·m 상호 오차가 10%를 초과합니다. "
+                    "현재 그래프/계산표는 출력 값을 우선 사용합니다."
+                )
+    return unique, errors
+
+
+def group_rows(rows: list[dict]) -> dict[tuple[str, str], list[dict]]:
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[(row["권선"], row["운전조건"])].append(row)
+    return dict(grouped)
+
+
+def grouped_by_bucket(rows: list[dict]) -> dict[tuple[str, str], list[dict]]:
+    raw = group_rows(rows)
+    out: dict[tuple[str, str], list[dict]] = {}
+    for (winding, rating), pts in raw.items():
+        out[(winding, rating_bucket(rating))] = pts
+    return out
+
+
+def bucket_representatives(rows: list[dict]) -> dict[tuple[str, str], str]:
+    reps: dict[tuple[str, str], str] = {}
+    for row in rows:
+        key = (row["권선"], rating_bucket(row["운전조건"]))
+        reps.setdefault(key, normalize_rating(row["운전조건"]))
+    return reps
+
+
+def power_at_source(row: dict) -> float | None:
+    kw = number(row.get("출력(kW)"))
+    if kw is not None:
+        return kw
+    rpm, nm = number(row.get("RPM")), number(row.get("토크(N·m)"))
+    if rpm is not None and nm is not None:
+        return nm * rpm / RPM_TO_TORQUE
+    return None
+
+
+def calc_at(points: list[dict], rpm: float) -> tuple[float | None, float | None]:
+    if not points or rpm < points[0]["RPM"] or rpm > points[-1]["RPM"]:
+        return None, None
+    for i, p in enumerate(points):
+        if abs(rpm - p["RPM"]) < 1e-9:
+            kw = power_at_source(p)
+            if kw is None:
+                return None, None
+            if rpm == 0:
+                return 0.0, number(p.get("토크(N·m)"))
+            return kw, kw * RPM_TO_TORQUE / rpm
+        if i + 1 < len(points) and p["RPM"] < rpm < points[i + 1]["RPM"]:
+            q = points[i + 1]
+            pkw, qkw = power_at_source(p), power_at_source(q)
+            if pkw is None or qkw is None:
+                return None, None
+            frac = (rpm - p["RPM"]) / (q["RPM"] - p["RPM"])
+            kw = pkw + frac * (qkw - pkw)
+            return kw, kw * RPM_TO_TORQUE / rpm if rpm else None
+    return None, None
+
+
+def calc_switched_at(grouped: dict[tuple[str, str], list[dict]], bucket: str, rpm: float,
+                     switch_rpm: int | None) -> tuple[float | None, float | None, str | None]:
+    low_pts = grouped.get(("LOW", bucket))
+    high_pts = grouped.get(("HIGH", bucket))
+    prefer_high = bool(switch_rpm is not None and switch_rpm > 0 and rpm >= switch_rpm)
+    order = [high_pts, low_pts] if prefer_high else [low_pts, high_pts]
+    source_labels = ["HIGH", "LOW"] if prefer_high else ["LOW", "HIGH"]
+    for pts, src in zip(order, source_labels):
+        if pts:
+            kw, nm = calc_at(pts, rpm)
+            if kw is not None:
+                return kw, nm, src
+    return None, None, None
+
+
+def rpm_grid(rows: list[dict], limit: int = 20000, step: int = 100, switch_rpm: int | None = None) -> list[float]:
+    anchors = {float(r["RPM"]) for r in rows if 0 <= r["RPM"] <= limit}
+    additional = {0.0, 0.6, 1.0, 10.0, 100.0, 500.0}
+    regular = set(range(0, limit + 1, step))
+    if switch_rpm is not None and 0 <= switch_rpm <= limit:
+        anchors.add(float(switch_rpm))
+    return sorted(anchors | {x for x in additional if x <= limit} | regular)
+
+
+def style_color(winding: str, bucket: str, quantity: str) -> str:
+    if winding == "LOW":
+        return LOW_POWER_COLORS.get(bucket, LOW_POWER_COLORS["OTHER"]) if quantity == "power" else LOW_TORQUE_COLORS.get(bucket, LOW_TORQUE_COLORS["OTHER"])
+    return HIGH_POWER_COLORS.get(bucket, HIGH_POWER_COLORS["OTHER"]) if quantity == "power" else HIGH_TORQUE_COLORS.get(bucket, HIGH_TORQUE_COLORS["OTHER"])
+
+
+def make_plot(rows: list[dict], max_rpm: int, show_power: bool = True, show_torque: bool = True,
+              switch_rpm: int | None = None, apply_switch: bool = True, show_raw_points: bool = True):
+    grouped = grouped_by_bucket(rows)
+    reps = bucket_representatives(rows)
+    fig = go.Figure()
+    show_switched = bool(apply_switch and switch_rpm is not None and switch_rpm > 0)
+
+    fig.update_layout(
+        paper_bgcolor="#ececec",
+        plot_bgcolor="#efefef",
+        height=700,
+        hovermode="x unified",
+        margin={"l": 85, "r": 80, "t": 70, "b": 90},
+        xaxis={
+            "title": {"text": "Spindle Speed (rpm)", "font": {"size": 28, "color": "#4b4b4b"}},
+            "range": [0, max_rpm],
+            "showgrid": True,
+            "gridcolor": "#c9c9c9",
+            "zeroline": False,
+            "tickfont": {"size": 14, "color": "#444"},
+        },
+        yaxis={
+            "title": {"text": "Torque (N·m)", "font": {"size": 18, "color": "#444"}},
+            "rangemode": "tozero",
+            "showgrid": True,
+            "gridcolor": "#d3d3d3",
+            "zeroline": False,
+            "tickfont": {"size": 13, "color": "#444"},
+        },
+        yaxis2={
+            "title": {"text": "Power (kW)", "font": {"size": 18, "color": "#444"}},
+            "overlaying": "y",
+            "side": "right",
+            "rangemode": "tozero",
+            "showgrid": False,
+            "tickfont": {"size": 13, "color": "#444"},
+        },
+        legend={"orientation": "h", "y": -0.17, "x": 0, "font": {"size": 12}},
+        title={"text": "(Electric Conversion)", "x": 0.5, "font": {"size": 18, "color": "#666"}},
+    )
+
+    if switch_rpm is not None and switch_rpm > 0:
+        fig.add_vline(x=switch_rpm, line_dash="dash", line_width=1.2, line_color="#6b7280")
+        fig.add_annotation(x=switch_rpm, y=0, yref="paper", text=f"{switch_rpm}", showarrow=False,
+                           yshift=-35, font={"size": 14, "color": "#222"})
+
+    if show_switched:
+        buckets = sorted({b for _, b in grouped}, key=bucket_order)
+        for bucket in buckets:
+            label = bucket_display(bucket, reps.get(("LOW", bucket)) or reps.get(("HIGH", bucket)))
+            xs = rpm_grid(rows, limit=max_rpm, step=max(25, int(max_rpm / 250) or 25), switch_rpm=switch_rpm)
+            power_y, torque_y, source_winding = [], [], []
+            for x in xs:
+                kw, nm, src = calc_switched_at(grouped, bucket, x, switch_rpm)
+                power_y.append(kw)
+                torque_y.append(nm)
+                source_winding.append(src)
+            # determine line colors based on the dominant winding after switch behavior.
+            # For reference-image-like styling: power from HIGH is blue, torque from HIGH is red,
+            # LOW-side portions keep gray/red-gray styling.
+            if show_power:
+                colors = []
+                last = None
+                for src in source_winding:
+                    c = style_color(src or "LOW", bucket, "power") if src else None
+                    colors.append(c)
+                    if c:
+                        last = c
+                color = style_color("HIGH" if any(s == "HIGH" for s in source_winding) else "LOW", bucket, "power")
+                fig.add_trace(go.Scatter(
+                    x=xs, y=power_y, mode="lines", name=f"{label} · Power",
+                    line={"color": color, "width": 3}, yaxis="y2", connectgaps=False,
+                    hovertemplate="RPM %{x:,.0f}<br>출력 %{y:.3f} kW<extra>%{fullData.name}</extra>"
+                ))
+            if show_torque:
+                color = style_color("HIGH" if any(s == "HIGH" for s in source_winding) else "LOW", bucket, "torque")
+                fig.add_trace(go.Scatter(
+                    x=xs, y=torque_y, mode="lines", name=f"{label} · Torque",
+                    line={"color": color, "width": 3}, yaxis="y", connectgaps=False,
+                    hovertemplate="RPM %{x:,.0f}<br>토크 %{y:.3f} N·m<extra>%{fullData.name}</extra>"
+                ))
+        if show_raw_points:
+            for (winding, bucket), pts in grouped.items():
+                label = bucket_display(bucket, reps.get((winding, bucket)))
+                xs = [p["RPM"] for p in pts]
+                if show_power:
+                    fig.add_trace(go.Scatter(
+                        x=xs, y=[power_at_source(p) for p in pts], mode="markers", showlegend=False,
+                        yaxis="y2", marker={"size": 6, "color": style_color(winding, bucket, "power")},
+                        hovertemplate=f"원본 기준점 ({winding})<br>정격 {label}<br>RPM %{{x:,.0f}}<br>출력 %{{y:.3f}} kW<extra></extra>"
+                    ))
+                if show_torque:
+                    fig.add_trace(go.Scatter(
+                        x=xs, y=[calc_at(pts, p["RPM"])[1] for p in pts], mode="markers", showlegend=False,
+                        yaxis="y", marker={"size": 5, "symbol": "square", "color": style_color(winding, bucket, "torque")},
+                        hovertemplate=f"원본 기준점 ({winding})<br>정격 {label}<br>RPM %{{x:,.0f}}<br>토크 %{{y:.3f}} N·m<extra></extra>"
+                    ))
+    else:
+        for (winding, bucket), pts in sorted(grouped.items(), key=lambda item: (item[0][0] != "LOW", bucket_order(item[0][1]))):
+            label = bucket_display(bucket, reps.get((winding, bucket)))
+            lower, upper = pts[0]["RPM"], pts[-1]["RPM"]
+            xs = sorted({round(lower + (upper - lower) * j / 250, 9) for j in range(251)} | {p["RPM"] for p in pts})
+            calculated = [calc_at(pts, x) for x in xs]
+            source_xs = [p["RPM"] for p in pts]
+            if show_power:
+                fig.add_trace(go.Scatter(
+                    x=xs, y=[item[0] for item in calculated], mode="lines",
+                    name=f"{winding} {label} · Power", line={"color": style_color(winding, bucket, "power"), "width": 3},
+                    hovertemplate="RPM %{x:,.0f}<br>출력 %{y:.3f} kW<extra>%{fullData.name}</extra>",
+                    yaxis="y2", connectgaps=False))
+                if show_raw_points:
+                    fig.add_trace(go.Scatter(
+                        x=source_xs, y=[power_at_source(p) for p in pts], mode="markers", showlegend=False,
+                        yaxis="y2", marker={"size": 5, "color": style_color(winding, bucket, "power")},
+                        hovertemplate="원본 기준점<br>RPM %{x:,.0f}<br>출력 %{y:.3f} kW<extra></extra>"))
+            if show_torque:
+                fig.add_trace(go.Scatter(
+                    x=xs, y=[item[1] for item in calculated], mode="lines", name=f"{winding} {label} · Torque",
+                    line={"color": style_color(winding, bucket, "torque"), "width": 2.6},
+                    hovertemplate="RPM %{x:,.0f}<br>토크 %{y:.3f} N·m<extra>%{fullData.name}</extra>",
+                    yaxis="y", connectgaps=False))
+                if show_raw_points:
+                    fig.add_trace(go.Scatter(
+                        x=source_xs, y=[calc_at(pts, p["RPM"])[1] for p in pts], mode="markers", showlegend=False,
+                        yaxis="y", marker={"size": 5, "color": style_color(winding, bucket, "torque"), "symbol": "square"},
+                        hovertemplate="원본 기준점<br>RPM %{x:,.0f}<br>토크 %{y:.3f} N·m<extra></extra>"))
+    return fig
+
+
+def _a1(col: int, row: int) -> str:
+    name = ""
+    col += 1
+    while col:
+        col, part = divmod(col - 1, 26)
+        name = chr(65 + part) + name
+    return f"{name}{row}"
+
+
+def _excel_formula(target_rpm_cell: str, anchor_start: int, anchor_end: int) -> str:
+    r_range = f"'기준점 입력'!$C${anchor_start}:$C${anchor_end}"
+    p_range = f"'기준점 입력'!$F${anchor_start}:$F${anchor_end}"
+    a = target_rpm_cell
+    m = f"MATCH({a},{r_range},1)"
+    x1 = f"INDEX({r_range},{m})"
+    x2 = f"INDEX({r_range},{m}+1)"
+    y1 = f"INDEX({p_range},{m})"
+    y2 = f"INDEX({p_range},{m}+1)"
+    p_last = f"INDEX({p_range},ROWS({p_range}))"
+    interpolated = f"{y1}+({a}-{x1})*({y2}-{y1})/({x2}-{x1})"
+    return (f'=IF(OR({a}<MIN({r_range}),{a}>MAX({r_range})),"",'
+            f'IF({a}=MAX({r_range}),{p_last},IFERROR({interpolated},"")))')
+
+
+def generate_excel(rows: list[dict], model_name: str, max_rpm: int = 20000,
+                   step: int = 100, switch_rpm: int | None = None, notes: str = "") -> bytes:
+    rows, problems = tidy_rows(rows)
+    if not rows:
+        raise ValueError("유효한 모터 입력 데이터가 없습니다.")
+    groups = group_rows(rows)
+    bucketed = grouped_by_bucket(rows)
+    reps = bucket_representatives(rows)
+    grid = rpm_grid(rows, limit=max_rpm, step=step, switch_rpm=switch_rpm)
+    out = io.BytesIO()
+    wb = xlsxwriter.Workbook(out, {"in_memory": True})
+    wb.set_properties({"title": "Motor Spindle Power/Torque Diagram", "comments": "Based on user supplied motor catalog data"})
+    sh_chart = wb.add_worksheet("통합 선도")
+    sh_grid = wb.add_worksheet("RPM 계산표")
+    sh_switch = wb.add_worksheet("권선절환 적용값")
+    sh_input = wb.add_worksheet("기준점 입력")
+    sh_help = wb.add_worksheet("사용 안내")
+
+    dark = "#17253F"
+    low_color, high_color = "#7a7a7a", "#2453ff"
+    fmt_title = wb.add_format({"font_color": "white", "bold": True, "font_size": 17, "bg_color": dark, "valign": "vcenter"})
+    fmt_head = wb.add_format({"bg_color": dark, "font_color": "#FFFFFF", "bold": True,
+                              "align": "center", "valign": "vcenter", "border": 1, "border_color": "#CED6E0", "text_wrap": True})
+    fmt_base = wb.add_format({"num_format": "0.00", "border": 1, "border_color": "#E2E8F0"})
+    fmt_input = wb.add_format({"num_format": "0.000", "border": 1, "border_color": "#D1D5DB", "bg_color": "#FFF7E8"})
+    fmt_formula = wb.add_format({"num_format": "0.000", "font_color": "#146C43", "border": 1, "border_color": "#E2E8F0"})
+    fmt_rpm = wb.add_format({"num_format": "0.##", "bold": True, "bg_color": "#F1F5F9", "border": 1, "border_color": "#DFE6EE"})
+    fmt_break = wb.add_format({"num_format": "0.##", "bold": True, "bg_color": "#FFF1A4", "border": 1, "border_color": "#DFE6EE"})
+    fmt_power = wb.add_format({"num_format": "0.000", "border": 1, "border_color": "#DFE6EE", "font_color": "#1E40AF"})
+    fmt_torque = wb.add_format({"num_format": "0.000", "border": 1, "border_color": "#DFE6EE", "font_color": "#9A3412"})
+    fmt_sub = wb.add_format({"bold": True, "font_color": dark, "bg_color": "#E8EDF5", "align": "center"})
+    fmt_txt = wb.add_format({"text_wrap": True, "valign": "top", "font_color": "#334155"})
+    fmt_err = wb.add_format({"num_format": "0.0%", "font_color": "#B91C1C", "border": 1, "border_color": "#DFE6EE"})
+
+    sh_input.merge_range("A1:G2", "모터 카탈로그 입력 기준점 · 수정 가능한 원본 값", fmt_title)
+    sh_input.write("A4", "모터명")
+    sh_input.write("B4", model_name)
+    sh_input.write("D4", "축 최대 RPM")
+    sh_input.write_number("E4", max_rpm)
+    sh_input.write("A5", "주의: 노란 셀의 원본 출력을 수정하면 RPM 계산표와 그래프가 자동 재계산됩니다.")
+    incols = ["권선", "정격", "RPM", "출력(kW) 입력", "토크(N·m) 입력", "계산용 출력(kW)", "출력/토크 상대오차"]
+    for c, label in enumerate(incols):
+        sh_input.write(6, c, label, fmt_head)
+    sh_input.freeze_panes(7, 2)
+    sh_input.set_column("A:A", 12)
+    sh_input.set_column("B:B", 21)
+    sh_input.set_column("C:G", 20)
+    row_map = {}
+    ir = 7
+    for key, pts in groups.items():
+        first = ir + 1
+        for p in pts:
+            sh_input.write(ir, 0, p["권선"], fmt_base)
+            sh_input.write(ir, 1, p["운전조건"], fmt_base)
+            sh_input.write_number(ir, 2, p["RPM"], fmt_input)
+            if p["출력(kW)"] is not None:
+                sh_input.write_number(ir, 3, p["출력(kW)"], fmt_input)
+            else:
+                sh_input.write_blank(ir, 3, None, fmt_input)
+            if p["토크(N·m)"] is not None:
+                sh_input.write_number(ir, 4, p["토크(N·m)"], fmt_input)
+            else:
+                sh_input.write_blank(ir, 4, None, fmt_input)
+            exrow = ir + 1
+            kw = power_at_source(p)
+            f = f'=IF(ISNUMBER(D{exrow}),D{exrow},IF(AND(ISNUMBER(E{exrow}),C{exrow}>0),E{exrow}*C{exrow}/{RPM_TO_TORQUE},""))'
+            sh_input.write_formula(ir, 5, f, fmt_formula, kw if kw is not None else "")
+            df = f'=IF(AND(ISNUMBER(D{exrow}),ISNUMBER(E{exrow}),C{exrow}>0,D{exrow}>0),ABS(D{exrow}-E{exrow}*C{exrow}/{RPM_TO_TORQUE})/D{exrow},"")'
+            sh_input.write_formula(ir, 6, df, fmt_err, abs((p["토크(N·m)"] or 0)*p["RPM"]/RPM_TO_TORQUE - (p["출력(kW)"] or 0)) / p["출력(kW)"] if p["출력(kW)"] and p["토크(N·m)"] and p["RPM"] else "")
+            ir += 1
+        row_map[key] = (first, ir)
+
+    by_winding = {}
+    for key in groups:
+        by_winding.setdefault(key[0], []).append(key)
+    winding_names = sorted(by_winding, key=lambda w: (w != 'LOW', w != 'HIGH', w))
+    for w in winding_names:
+        by_winding[w].sort(key=lambda key: display_rating_order(key[1]))
+
+    series_meta = []
+    blocks = []
+    next_col = 1
+    for index, w in enumerate(winding_names):
+        keys = by_winding[w]
+        power_begin = next_col
+        power_cols = {}
+        for key in keys:
+            power_cols[key] = next_col
+            next_col += 1
+        torque_begin = next_col
+        torque_cols = {}
+        for key in keys:
+            torque_cols[key] = next_col
+            next_col += 1
+        winding_end = next_col - 1
+        blocks.append((w, power_begin, torque_begin, winding_end, keys))
+        for key in keys:
+            series_meta.append((key, power_cols[key], torque_cols[key]))
+        if index < len(winding_names) - 1:
+            next_col += 1
+
+    final_col = max(1, next_col - 1)
+    sh_grid.merge_range(0, 0, 1, final_col, f"{model_name} | 회전수별 출력·토크 계산표", fmt_title)
+    sh_grid.write('A4', '최대 RPM')
+    sh_grid.write_number('B4', max_rpm)
+    sh_grid.write('C4', '계산 간격')
+    sh_grid.write_number('D4', step)
+    sh_grid.write('E4', '절환 RPM')
+    sh_grid.write('F4', switch_rpm if switch_rpm is not None else '미지정')
+    sh_grid.merge_range(5, 0, 5, final_col,
+                        '각 권선은 출력(kW)을 먼저 모으고 다음에 토크(N·m)를 모았습니다. 기준점 밖은 공란이며 임의 외삽하지 않습니다.', fmt_txt)
+    sh_grid.merge_range(6, 0, 7, 0, '주축 회전수', fmt_sub)
+    sh_grid.write(8, 0, 'RPM', fmt_head)
+    sh_grid.set_column(0, 0, 17)
+    sh_grid.freeze_panes(9, 1)
+    fmt_low = wb.add_format({'bold': True, 'font_color': 'white', 'bg_color': low_color, 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#FFFFFF'})
+    fmt_high = wb.add_format({'bold': True, 'font_color': 'white', 'bg_color': high_color, 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#FFFFFF'})
+    fmt_power_group = wb.add_format({'bold': True, 'font_color': '#1D4ED8', 'bg_color': '#DBEAFE', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#BACCE9'})
+    fmt_torque_group = wb.add_format({'bold': True, 'font_color': '#9A3412', 'bg_color': '#FFEDD5', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#F7C9A2'})
+    fmt_condition_kw = wb.add_format({'bold': True, 'font_color': '#1E40AF', 'bg_color': '#EFF6FF', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#CCD9EA', 'text_wrap': True})
+    fmt_condition_nm = wb.add_format({'bold': True, 'font_color': '#9A3412', 'bg_color': '#FFF7ED', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': '#F2D4B5', 'text_wrap': True})
+    sh_grid.set_row(6, 25)
+    sh_grid.set_row(7, 25)
+    sh_grid.set_row(8, 36)
+
+    for w, pstart, tstart, end, keys in blocks:
+        heading = fmt_low if w == 'LOW' else fmt_high
+        sh_grid.merge_range(6, pstart, 6, end, f'{w} 권선', heading)
+        if len(keys) > 1:
+            sh_grid.merge_range(7, pstart, 7, tstart - 1, '출력 (kW)', fmt_power_group)
+            sh_grid.merge_range(7, tstart, 7, end, '토크 (N·m)', fmt_torque_group)
+        else:
+            sh_grid.write(7, pstart, '출력 (kW)', fmt_power_group)
+            sh_grid.write(7, tstart, '토크 (N·m)', fmt_torque_group)
+        for idx, key in enumerate(keys):
+            sh_grid.write(8, pstart + idx, key[1], fmt_condition_kw)
+            sh_grid.write(8, tstart + idx, key[1], fmt_condition_nm)
+        sh_grid.set_column(pstart, end, 17)
+
+    if len(blocks) > 1:
+        for left, right in zip(blocks, blocks[1:]):
+            spacer_col = left[3] + 1
+            sh_grid.set_column(spacer_col, spacer_col, 3.5)
+
+    anchor_rpms = {r['RPM'] for r in rows}
+    for n, rpm in enumerate(grid):
+        excel_row = n + 10
+        sh_grid.write_number(9 + n, 0, rpm, fmt_break if rpm in anchor_rpms or (switch_rpm is not None and rpm == switch_rpm) else fmt_rpm)
+        for key, col_p, col_t in series_meta:
+            source_points = groups[key]
+            p_value, t_value = calc_at(source_points, rpm)
+            a_start, a_end = row_map[key]
+            formula = _excel_formula(f'$A{excel_row}', a_start, a_end)
+            sh_grid.write_formula(9 + n, col_p, formula, fmt_power, p_value if p_value is not None else '')
+            zero_t = next((number(pt.get('토크(N·m)')) for pt in source_points if pt['RPM'] == 0), None)
+            p_cell = _a1(col_p, excel_row)
+            if zero_t is not None:
+                tq = f'=IF($A{excel_row}=0,{zero_t},IF(ISNUMBER({p_cell}),{p_cell}*{RPM_TO_TORQUE}/$A{excel_row},""))'
+            else:
+                tq = f'=IF($A{excel_row}=0,"",IF(ISNUMBER({p_cell}),{p_cell}*{RPM_TO_TORQUE}/$A{excel_row},""))'
+            sh_grid.write_formula(9 + n, col_t, tq, fmt_torque, t_value if t_value is not None else '')
+    sh_grid.autofilter(8, 0, 8 + len(grid), 0)
+
+    # Switched / applied values sheet.
+    sh_switch.merge_range('A1:K2', f'{model_name} | 권선절환 적용값', fmt_title)
+    sh_switch.write('A4', '최대 RPM')
+    sh_switch.write_number('B4', max_rpm)
+    sh_switch.write('D4', '절환 RPM')
+    sh_switch.write('E4', switch_rpm if switch_rpm is not None else '미지정')
+    sh_switch.write('A5', '입력한 절환 RPM 기준으로 LOW/HIGH를 자동 선택한 적용값입니다. 절환 RPM이 없으면 사용 가능한 곡선을 우선 표시합니다.', fmt_txt)
+    sh_switch.write(7, 0, 'RPM', fmt_head)
+    sh_switch.freeze_panes(8, 1)
+    sh_switch.set_column(0, 0, 16)
+    buckets = sorted({bucket for _, bucket in bucketed}, key=bucket_order)
+    col = 1
+    switched_meta = []
+    for idx, bucket in enumerate(buckets):
+        label = bucket_display(bucket, reps.get(('LOW', bucket)) or reps.get(('HIGH', bucket)))
+        sh_switch.merge_range(6, col, 6, col + 1, label, fmt_sub)
+        sh_switch.write(7, col, '출력 (kW)', fmt_condition_kw)
+        sh_switch.write(7, col + 1, '토크 (N·m)', fmt_condition_nm)
+        sh_switch.set_column(col, col + 1, 16)
+        switched_meta.append((bucket, label, col, col + 1))
+        col += 2
+    for n, rpm in enumerate(grid):
+        sh_switch.write_number(8 + n, 0, rpm, fmt_break if rpm in anchor_rpms or (switch_rpm is not None and rpm == switch_rpm) else fmt_rpm)
+        for bucket, label, col_p, col_t in switched_meta:
+            kw, nm, src = calc_switched_at(bucketed, bucket, rpm, switch_rpm)
+            sh_switch.write(8 + n, col_p, kw, fmt_power)
+            sh_switch.write(8 + n, col_t, nm, fmt_torque)
+
+    chart = wb.add_chart({"type": "scatter", "subtype": "straight"})
+    if switch_rpm is not None and switch_rpm > 0:
+        source_sheet_name = '권선절환 적용값'
+        for bucket, label, col_p, col_t in switched_meta:
+            color_power = style_color('HIGH' if ('HIGH', bucket) in bucketed else 'LOW', bucket, 'power')
+            color_torque = style_color('HIGH' if ('HIGH', bucket) in bucketed else 'LOW', bucket, 'torque')
+            chart.add_series({"name": f"{label} · Power",
+                              "categories": [source_sheet_name, 8, 0, 8 + len(grid) - 1, 0],
+                              "values": [source_sheet_name, 8, col_p, 8 + len(grid) - 1, col_p],
+                              "line": {"color": color_power, "width": 2.5},
+                              "marker": {"type": "none"}, "y2_axis": True})
+            chart.add_series({"name": f"{label} · Torque",
+                              "categories": [source_sheet_name, 8, 0, 8 + len(grid) - 1, 0],
+                              "values": [source_sheet_name, 8, col_t, 8 + len(grid) - 1, col_t],
+                              "line": {"color": color_torque, "width": 2.5},
+                              "marker": {"type": "none"}, "y2_axis": False})
+    else:
+        for key, col_p, col_t in series_meta:
+            bucket = rating_bucket(key[1])
+            color_power = style_color(key[0], bucket, 'power')
+            color_torque = style_color(key[0], bucket, 'torque')
+            chart.add_series({"name": f"{key[0]} {key[1]} · Power",
+                              "categories": ['RPM 계산표', 9, 0, 9 + len(grid) - 1, 0],
+                              "values": ['RPM 계산표', 9, col_p, 9 + len(grid) - 1, col_p],
+                              "line": {"color": color_power, "width": 2.2},
+                              "marker": {"type": "none"}, "y2_axis": True})
+            chart.add_series({"name": f"{key[0]} {key[1]} · Torque",
+                              "categories": ['RPM 계산표', 9, 0, 9 + len(grid) - 1, 0],
+                              "values": ['RPM 계산표', 9, col_t, 9 + len(grid) - 1, col_t],
+                              "line": {"color": color_torque, "width": 2.2},
+                              "marker": {"type": "none"}, "y2_axis": False})
+    chart.set_title({"name": f"{model_name} | SPINDLE PERFORMANCE DIAGRAM"})
+    chart.set_x_axis({"name": "Spindle Speed (rpm)", "min": 0, "max": max_rpm, "major_gridlines": {"visible": True}})
+    chart.set_y_axis({"name": "Torque (N·m)", "min": 0, "major_gridlines": {"visible": True}})
+    chart.set_y2_axis({"name": "Power (kW)", "min": 0, "major_gridlines": {"visible": False}})
+    chart.set_legend({"position": "bottom", "font": {"size": 8}})
+    chart.set_size({"width": 1100, "height": 600})
+    chart.set_style(10)
+    sh_chart.merge_range("A1:P2", "SPINDLE PERFORMANCE DIAGRAM | 출력·토크 통합 선도", fmt_title)
+    sh_chart.write("A4", "모터명")
+    sh_chart.write("B4", model_name)
+    sh_chart.write("D4", "최대 RPM")
+    sh_chart.write_number("E4", max_rpm)
+    sh_chart.write("G4", "절환 RPM")
+    sh_chart.write("H4", switch_rpm if switch_rpm is not None else '미지정')
+    sh_chart.write("A5", "권선절환 RPM이 입력되면 [권선절환 적용값] 시트를 기준으로 그래프를 생성합니다.")
+    sh_chart.insert_chart("B7", chart)
+    sh_chart.set_column("A:A", 16)
+    sh_chart.set_column("B:P", 12)
+
+    instructions = [
+        "원본 캡처의 RPM/출력/토크를 AI로 읽고 사람이 검토해야 합니다. OCR 결과가 맞는지 반드시 확인하십시오.",
+        "[기준점 입력]의 연한 노랑 셀(RPM/출력/토크)은 카탈로그 원본 수치입니다. F 열은 그래프 계산에 쓰는 출력입니다.",
+        "계산 방법: 기준점 사이에서는 출력(kW)을 선형 보간하고 T(N·m) = 9549.2965855 × P(kW) / rpm으로 토크를 계산합니다.",
+        "카탈로그에 출력/토크가 둘 다 있더라도 반올림으로 다를 수 있으므로 출력(kW)을 기준으로 계산합니다. G열 오차를 확인하십시오.",
+        "원본 기준점의 최소/최대 RPM을 벗어나는 값은 임의로 외삽하지 않고 비웁니다.",
+        "[RPM 계산표]는 LOW 출력→LOW 토크→HIGH 출력→HIGH 토크 순서입니다. 없는 정격은 생성하지 않습니다.",
+        "[권선절환 적용값]은 사용자가 입력한 절환 RPM에 따라 LOW/HIGH 중 사용 가능한 값을 자동 선택한 결과입니다.",
+        "통합 선도 차트는 절환 RPM이 있으면 [권선절환 적용값], 없으면 [RPM 계산표]를 기준으로 작성됩니다.",
+        "원본 행 추가/삭제 또는 정격별 데이터 행 수 변경 시에는 앱에서 재생성하는 것이 안전합니다.",
+        "저장된 엑셀은 로컬 파일이며, 사용자 확인 없이 모터 성능을 보증하는 자료로 사용하지 마십시오.",
+    ]
+    sh_help.merge_range("A1:H2", "사용 안내 · 계산 기준", fmt_title)
+    sh_help.set_column("A:A", 5)
+    sh_help.set_column("B:B", 108)
+    for i, line in enumerate(instructions, 4):
+        sh_help.write_number(i, 0, i - 3)
+        sh_help.write(i, 1, line, fmt_txt)
+        sh_help.set_row(i, 35)
+    if notes:
+        sh_help.write(17, 1, "사용자/AI 참고 사항: " + notes, fmt_txt)
+    if problems:
+        sh_help.write(19, 1, "검토 경고: " + " / ".join(problems[:30]), fmt_txt)
+    wb.close()
+    return out.getvalue()
+
+
+def make_sample() -> tuple[list[dict], str]:
+    sample = {
+        ("LOW", "S1 Cont."): {
+            "rpms": [0,1415,1650,2200,2300,2400,4500,6000],
+            "kw": [0,6.8,7.9,10.5,11,11,11,11],
+            "nm": [None,45.7,45.7,45.7,45.7,43.8,23.3,17.5]},
+        ("LOW", "S2 15min"): {
+            "rpms": [0,1415,1650,2200,2300,2400,4500,6000],
+            "kw": [0,8.8,10.3,13.8,14.4,15,15,15],
+            "nm": [None,59.7,59.7,59.7,59.7,59.7,31.8,23.9]},
+        ("LOW", "S3/S6 25%"): {
+            "rpms": [0,1415,1650,2200,2300,2400,4500,6000],
+            "kw": [0,11.9,13.9,18.5,18.5,18.5,18.5,15],
+            "nm": [None,80.3,80.3,80.3,76.8,73.6,39.3,23.9]},
+        ("LOW", "S3/S6 15%"): {
+            "rpms": [0,1415,1650,2200], "kw": [0,15.9,18.5,18.5],
+            "nm": [None,107,107,80.3]},
+        ("LOW", "S3/S6 10%"): {
+            "rpms": [0,1415,1650], "kw": [0,18.5,18.5], "nm": [None,125,107]},
+        ("HIGH", "S1 Cont."): {
+            "rpms": [0,4500,6000,10000,12000,14000,18000,20000],
+            "kw": [0,11.3,15,15,15,15,11.7,10],
+            "nm": [None,23.9,23.9,14.3,11.9,10.2,6.19,4.77]},
+        ("HIGH", "S2 10min"): {
+            "rpms": [0,4500,6000,10000,12000,14000,18000,20000],
+            "kw": [0,13.9,18.5,18.5,18.5,18.5,14.8,13],
+            "nm": [None,29.4,29.4,17.7,14.7,12.6,7.87,6.21]},
+        ("HIGH", "S3/S6 25%"): {
+            "rpms": [0,4500,6000,10000,12000,14000],
+            "kw": [0,19.5,26,26,22.3,18.5],
+            "nm": [None,41.4,41.4,24.8,17.7,12.6]},
+    }
+    rows = []
+    for (w, rating), entry in sample.items():
+        for rpm, kw, nm in zip(entry["rpms"], entry["kw"], entry["nm"]):
+            rows.append({"권선": w, "운전조건": rating, "RPM": rpm,
+                         "출력(kW)": kw, "토크(N·m)": nm})
+    return rows, "이전 대화에 첨부된 LOW/HIGH 모터 카탈로그를 수동 전사한 예제. 실제 적용 전 원본 대조 필요."
+
+
+st.set_page_config(page_title="주축 출력선도 생성기", page_icon="📈", layout="wide")
+DATA_DIR = Path("data/motor_specs")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+SYSTEM_PROMPT = """
+You are a technical transcription assistant for industrial motor PERFORMANCE TABLES.
+The user uploads one or more screen captures of motor power/torque/RPM tables and charts.
+Your job is ONLY to TRANSCRIBE values that are actually printed in the source.
+Extract ALL winding sections separately (LOW / HIGH, if shown) and EACH duty curve
+(S1 continuous, S2 n minutes, S3/S6 XX%, etc.) separately.
+
+IMPORTANT RULES:
+1) Prefer the NUMERIC specification tables rather than approximating numbers from plotted curves.
+2) Do not fill in any missing/blank/dashed cell. Use null for absent power or torque.
+3) Preserve every printed RPM anchor, including 0 rpm for zero power if 0 is printed.
+4) At 0 rpm torque is NOT automatically 0. Use null if the catalog doesn't specify torque.
+5) Preserve the distinction among 10%, 15%, 25%, S1, S2 and LOW/HIGH.
+6) Ignore maximum current (A), winding resistance (mOhm) and power factor (percent)
+   as curve points. Put such supplementary information in notes if relevant.
+7) Do not calculate or infer the winding changeover speed if not explicitly stated.
+8) If the image is only an Excel example without a motor numeric specification table,
+   return curves=[] and a note that extraction is not possible.
+9) If a number is unreadable, omit that cell (null) rather than guess.
+10) Keep the motor_name empty if not displayed. maximum_rpm only if explicitly stated.
+Return ONLY a JSON object following this exact example shape:
+{
+  "motor_name": "motor designation or empty string",
+  "maximum_rpm": 20000,
+  "curves": [
+    {
+      "winding": "LOW",
+      "rating": "S1 Cont.",
+      "points": [
+        {"rpm": 0, "power_kw": 0, "torque_nm": null},
+        {"rpm": 1415, "power_kw": 6.8, "torque_nm": 45.7}
+      ]
+    }
+  ],
+  "notes": []
+}
+The values above are an example of FORMAT ONLY. Never copy example values unless present in image.
+Use JSON null for unknown numeric values. maximum_rpm should be null when not explicitly specified.
+All numbers must be JSON numbers, not formatted strings. No prose, no markdown.
+"""
+
+
+def secret(name: str) -> str:
+    try:
+        return str(st.secrets.get(name, ""))
+    except (FileNotFoundError, AttributeError, KeyError):
+        return ""
+
+
+def record_payload(rows, motor_name, rpm_limit, notes, record_id) -> dict:
+    return {
+        "record_id": record_id,
+        "motor_name": motor_name,
+        "max_rpm": rpm_limit,
+        "notes": notes,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "rows": rows,
+        "source_method": "motor-catalog-screenshot / manual-review",
+        "schema_version": 1,
+    }
+
+
+def slug(s: str) -> str:
+    s = re.sub(r"[^0-9a-zA-Z가-힣_-]+", "_", s.strip())
+    return (s[:64] or "motor")
+
+
+def local_path(payload: dict) -> Path:
+    return DATA_DIR / f"{slug(payload['motor_name'])}_{payload['record_id']}.json"
+
+
+def save_local(payload: dict):
+    local_path(payload).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def github_config() -> tuple[str, str, str]:
+    return secret("GITHUB_TOKEN"), secret("GITHUB_REPO"), secret("GITHUB_BRANCH") or "main"
+
+
+def github_request(method, url, token, **kwargs):
+    headers = {"Authorization": f"Bearer {token}",
+               "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28"}
+    return requests.request(method, url, headers=headers, timeout=25, **kwargs)
+
+
+def github_save(payload: dict) -> str:
+    token, repo, branch = github_config()
+    if not token or not repo:
+        return "GitHub 자동 저장 미설정 (현재 앱 서버 및 JSON 다운로드만 가능)"
+    repo_info = github_request("GET", f"https://api.github.com/repos/{repo}", token)
+    if repo_info.status_code != 200:
+        raise RuntimeError(f"GitHub 저장소 접근 실패 HTTP {repo_info.status_code}")
+    if not repo_info.json().get("private", False):
+        raise RuntimeError("모터 사양의 공개 유출을 막기 위해 Public 저장소에는 자동 저장하지 않습니다. Private 저장소를 지정하십시오.")
+    relpath = f"motor_specs/{slug(payload['motor_name'])}_{payload['record_id']}.json"
+    url = f"https://api.github.com/repos/{repo}/contents/{relpath}"
+    before = github_request("GET", url, token, params={"ref": branch})
+    existing = before.json().get("sha") if before.status_code == 200 else None
+    if before.status_code not in (200, 404):
+        raise RuntimeError(f"GitHub 조회 실패 HTTP {before.status_code}: {before.text[:300]}")
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    body = {"message": f"Save motor spec {payload['motor_name']}",
+            "content": base64.b64encode(raw).decode("ascii"), "branch": branch}
+    if existing:
+        body["sha"] = existing
+    result = github_request("PUT", url, token, json=body)
+    if result.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub 저장 실패 HTTP {result.status_code}: {result.text[:300]}")
+    return f"GitHub 저장 완료: {repo}/{relpath}"
+
+
+def github_records() -> list[dict]:
+    token, repo, branch = github_config()
+    if not token or not repo:
+        return []
+    url = f"https://api.github.com/repos/{repo}/contents/motor_specs"
+    res = github_request("GET", url, token, params={"ref": branch})
+    if res.status_code == 404:
+        return []
+    res.raise_for_status()
+    return [item for item in res.json() if item.get("name", "").endswith(".json")]
+
+
+def github_load(filename: str) -> dict:
+    token, repo, branch = github_config()
+    url = f"https://api.github.com/repos/{repo}/contents/motor_specs/{filename}"
+    res = github_request("GET", url, token, params={"ref": branch})
+    res.raise_for_status()
+    data = res.json()
+    return json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+
+
+def commit_save(rows, model_name, limit, notes, record_id) -> tuple[dict, str]:
+    payload = record_payload(rows, model_name, limit, notes, record_id)
+    save_local(payload)
+    github_message = github_save(payload) if github_config()[0] and github_config()[1] else "GitHub 연결 없음"
+    return payload, github_message
+
+
+def extract_images(uploaded, api_key: str, model: str) -> dict:
+    """Gemini REST API: no Pydantic or google-genai dependency required.
+
+    The HTTP response is untrusted transcription data, not a guaranteed motor spec.
+    It must be reviewed by a person before using it for design decisions.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", model.strip()):
+        raise ValueError("Gemini 모델명은 영문/숫자/하이픈/마침표/밑줄만 허용합니다.")
+
+    parts = [{"text": SYSTEM_PROMPT}]
+    raw_total = 0
+    for f in uploaded:
+        raw = f.getvalue()
+        raw_total += len(raw)
+        if len(raw) > 10 * 1024 * 1024:
+            raise ValueError(f"{f.name}: 이미지 1장당 10MB 이하로 줄여주세요.")
+        # Gemini inline-data has a request size limitation including base64 overhead.
+        if raw_total > 12 * 1024 * 1024:
+            raise ValueError("이미지 총 용량을 12MB 이하로 줄이거나 나누어 올려주세요.")
+        mime = "image/png" if f.type == "image/png" else "image/jpeg"
+        parts.append({"inline_data": {
+            "mime_type": mime,
+            "data": base64.b64encode(raw).decode("ascii"),
+        }})
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model.strip()}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+    }
+    try:
+        reply = requests.post(
+            url, json=payload,
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            timeout=120,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Gemini API에 연결하지 못했습니다: {type(exc).__name__}") from exc
+    if not reply.ok:
+        # Avoid displaying API-key-bearing URLs or the full request/response body.
+        try:
+            info = reply.json().get("error", {})
+            detail = str(info.get("message", ""))[:400]
+        except ValueError:
+            detail = ""
+        raise RuntimeError(f"Gemini API HTTP {reply.status_code}: {detail}")
+    try:
+        data = reply.json()
+        candidates = data.get("candidates", [])
+        text_parts = candidates[0]["content"]["parts"]
+        raw_json = "\n".join(part["text"] for part in text_parts if "text" in part).strip()
+        # Some models may return a fenced JSON block even with JSON output mode.
+        if raw_json.startswith("```"):
+            raw_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_json).strip()
+        catalog = json.loads(raw_json)
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("Gemini가 유효한 모터 사양 JSON을 반환하지 않았습니다. 이미지나 모델을 확인하세요.") from exc
+    if not isinstance(catalog, dict) or not isinstance(catalog.get("curves"), list):
+        raise RuntimeError("AI 응답에 curves 배열이 없습니다. 다른 이미지를 사용하거나 수동으로 입력하세요.")
+    return catalog
+
+
+def flatten(catalog: dict) -> list[dict]:
+    """Normalize untrusted JSON records, letting tidy_rows reject bad numbers."""
+    rows = []
+    for curve in catalog.get("curves", []):
+        if not isinstance(curve, dict):
+            continue
+        points = curve.get("points", [])
+        if not isinstance(points, list):
+            continue
+        for p in points:
+            if not isinstance(p, dict):
+                continue
+            rows.append({
+                "권선": normalize_winding(curve.get("winding", "LOW")),
+                "운전조건": normalize_rating(curve.get("rating", "S1")),
+                "RPM": p.get("rpm"),
+                "출력(kW)": p.get("power_kw"),
+                "토크(N·m)": p.get("torque_nm"),
+            })
+    return rows
+
+
+def use_record(payload: dict):
+    st.session_state.rows = payload.get("rows", [])
+    st.session_state.motor_name = payload.get("motor_name", "모터 모델명")
+    st.session_state.max_rpm = max(100, int(payload.get("max_rpm") or 20000))
+    st.session_state.notes = payload.get("notes", "")
+    st.session_state.record_id = payload.get("record_id", str(uuid.uuid4())[:8])
+    st.session_state.editor_version += 1
+    st.session_state.pop("excel_bytes", None)
+    st.session_state.pop("excel_key", None)
+
+
+def new_id():
+    return uuid.uuid4().hex[:10]
+
+
+# 클립보드 이미지를 기존 파일 업로드와 동일하게 처리하기 위한 어댑터.
+# 원본 이미지 바이트는 세션 내에서만 보관하며, 자동으로 파일로 저장하지 않습니다.
+class ClipboardImage:
+    def __init__(self, name: str, raw: bytes):
+        self.name = name
+        self.type = "image/png"
+        self._raw = raw
+
+    def getvalue(self) -> bytes:
+        return self._raw
+
+
+def clipboard_files() -> list[ClipboardImage]:
+    return [ClipboardImage(item["name"], item["data"])
+            for item in st.session_state.get("clipboard_images", [])]
+
+
+def add_clipboard_image(image) -> tuple[bool, str]:
+    """Clipboard -> PNG; exact same bytes flow as a normal uploaded file."""
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    raw = buffer.getvalue()
+    if len(raw) > 10 * 1024 * 1024:
+        return False, "캡처 이미지가 10MB를 초과합니다. 캡처 범위를 줄인 뒤 다시 등록하세요."
+    digest = hashlib.sha256(raw).hexdigest()
+    entries = st.session_state.setdefault("clipboard_images", [])
+    if any(item["sha256"] == digest for item in entries):
+        return False, "같은 캡처 이미지가 이미 등록되어 있습니다."
+    filename = f"clipboard_{len(entries) + 1:02d}_{digest[:8]}.png"
+    entries.append({"name": filename, "sha256": digest, "data": raw})
+    return True, f"캡처 등록 완료: {filename}"
+
+
+# ─────────────────────────────────────────────────────────
+# 화면 구성 : 이미지 등록 → 인식 → 검토/저장 → 그래프/엑셀
+# ─────────────────────────────────────────────────────────
+def fingerprint_uploads(files) -> str | None:
+    if not files:
+        return None
+    digest = hashlib.sha256()
+    for f in files:
+        digest.update(f.name.encode("utf-8", errors="replace"))
+        digest.update(f.getvalue())
+    return digest.hexdigest()
+
+
+def file_audit(files):
+    """파일을 선택했다는 사실과 실제 이미지를 분석했다는 사실은 구분한다."""
+    infos, errors = [], []
+    for f in files or []:
+        raw = f.getvalue()
+        png = raw.startswith(b"\x89PNG\r\n\x1a\n")
+        jpeg = raw.startswith(b"\xff\xd8\xff")
+        valid_image = png or jpeg
+        if not valid_image:
+            errors.append(f"{f.name}: PNG/JPEG 이미지 형식이 아닙니다.")
+        if not raw:
+            errors.append(f"{f.name}: 파일 내용이 비어 있습니다.")
+        if len(raw) > 10 * 1024 * 1024:
+            errors.append(f"{f.name}: AI 인식은 한 장당 10MB까지 지원합니다.")
+        infos.append({"파일명": f.name, "크기": f"{len(raw) / (1024*1024):.2f} MB",
+                      "이미지 확인": "확인" if valid_image else "형식 오류"})
+    if sum(len(f.getvalue()) for f in files or []) > 12 * 1024 * 1024:
+        errors.append("전체 이미지 용량이 12MB를 초과했습니다. 나누어서 등록하세요.")
+    return infos, errors
+
+
+def content_signature(rows, name: str, limit: int, notes: str) -> str:
+    raw = json.dumps({"rows": rows, "name": name, "max": limit, "notes": notes},
+                     ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def reset_excel():
+    st.session_state.pop("excel_bytes", None)
+    st.session_state.pop("excel_key", None)
+
+
+for k, v in {
+    "rows": [], "motor_name": "", "max_rpm": 20000,
+    "record_id": new_id(), "notes": "", "editor_version": 0,
+    "switch_rpm_user": 0, "show_switch_mode": True,
+    "recognized_signature": None, "recognition_report": None,
+    "recognition_error": "", "saved_signature": None,
+    "saved_message": "", "data_origin": "미등록",
+    "clipboard_images": [], "clipboard_feedback": "", "clipboard_button_version": 0,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+app_password = secret("APP_PASSWORD")
+if app_password and not st.session_state.get("authenticated", False):
+    st.title("🔐 주축 출력선도 생성기")
+    attempt = st.text_input("앱 접속 비밀번호", type="password")
+    if st.button("접속", type="primary"):
+        if attempt == app_password:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 올바르지 않습니다.")
+    st.stop()
+
+with st.sidebar:
+    st.header("⚙️ 설정 및 저장 내역")
+    with st.expander("AI 이미지 인식 설정", expanded=False):
+        api_key = st.text_input("Gemini API 키", value=secret("GEMINI_API_KEY"),
+                                type="password", help="Streamlit Secrets 설정을 권장합니다.")
+        preset_models = [
+            "gemini-3.8-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-pro",
+            "직접 입력",
+        ]
+        default_model = secret("GEMINI_MODEL") or "gemini-3.8-flash"
+        default_index = preset_models.index(default_model) if default_model in preset_models else len(preset_models) - 1
+        selected_model = st.selectbox("Google Gemini 모델 선택", preset_models, index=default_index,
+                                      help="기본값은 gemini-3.8-flash 입니다. Google 정책 변경 시 다른 모델을 선택하거나 직접 입력할 수 있습니다.")
+        if selected_model == "직접 입력":
+            model = st.text_input("직접 입력 모델명", value=default_model if default_model not in preset_models else "gemini-3.8-flash")
+        else:
+            model = selected_model
+        st.caption("기본 권장 모델: gemini-3.8-flash · 필요 시 다른 Google 모델을 직접 선택하거나 직접 입력할 수 있습니다. 인식 시 이미지가 Google Gemini API로 전달됩니다.")
+    if not app_password:
+        st.warning("APP_PASSWORD 미설정: 공개 앱이라면 접근 제한 설정을 권장합니다.")
+    with st.expander("저장된 모터 사양 불러오기", expanded=False):
+        paths = sorted(DATA_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if paths:
+            chosen = st.selectbox("이 서버에 저장된 사양", paths, format_func=lambda f: f.stem)
+            if st.button("서버 저장본 불러오기", use_container_width=True):
+                use_record(json.loads(chosen.read_text(encoding="utf-8")))
+                st.session_state.data_origin = "서버 JSON"
+                st.session_state.recognized_signature = None
+                st.session_state.recognition_report = None
+                st.session_state.saved_signature = None
+                st.session_state.saved_message = "불러온 데이터를 확인해 주세요."
+                st.rerun()
+        else:
+            st.caption("현재 서버에 저장된 사양이 없습니다.")
+        if github_config()[0] and github_config()[1]:
+            try:
+                remote = github_records()
+                if remote:
+                    name = st.selectbox("GitHub 영구 저장 사양", [i["name"] for i in remote])
+                    if st.button("GitHub 저장본 불러오기", use_container_width=True):
+                        use_record(github_load(name))
+                        st.session_state.data_origin = "GitHub JSON"
+                        st.session_state.recognized_signature = None
+                        st.session_state.recognition_report = None
+                        st.session_state.saved_signature = None
+                        st.session_state.saved_message = "불러온 데이터를 확인해 주세요."
+                        st.rerun()
+            except Exception as exc:
+                st.warning(f"GitHub 저장 목록을 읽을 수 없습니다: {exc}")
+        else:
+            st.caption("영구 저장을 원하면 별도 Private GitHub 저장소 연동이 필요합니다.")
+    st.caption("서버 임시 저장은 재배포 후 사라질 수 있습니다. JSON 백업 또는 GitHub 저장을 이용하세요.")
+
+st.title("⚙️ 주축 출력선도 생성기")
+st.caption("모터 모델명 입력 → 사진 등록 → AI 숫자 인식 → 값 검토·저장 → 권선절환 반영 출력선도/엑셀 내보내기")
+
+# 상단 고정 진행 상태. 업로드 파일 접수, AI 인식, 데이터 저장은 각각 별개의 상태입니다.
+files_at_top = list(st.session_state.get('motor_catalog_images') or []) + clipboard_files()
+current_upload_sig = fingerprint_uploads(files_at_top)
+top_file_info, top_file_errors = file_audit(files_at_top)
+top_uploaded = bool(files_at_top and not top_file_errors)
+top_recognized = bool(top_uploaded and current_upload_sig == st.session_state.recognized_signature)
+top_rows = bool(st.session_state.rows)
+top_saved = bool(st.session_state.saved_signature)
+with st.container(border=True):
+    st.markdown('**진행 현황 — 사진만 선택한 상태와 AI 분석 완료 상태는 다릅니다.**')
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric('① 사진 등록', f'{len(files_at_top)}장 완료' if top_uploaded else '등록 대기')
+    c2.metric('② AI 인식', '완료' if top_recognized else ('재인식 필요' if top_uploaded and top_rows and st.session_state.data_origin == 'AI 인식' else '실행 대기'))
+    c3.metric('③ 사양 검토', f'{len(st.session_state.rows)}개 기준점' if top_rows else '검토 대기')
+    c4.metric('④ 사양 저장', '저장 이력 있음' if top_saved else '저장 대기')
+    if top_file_errors:
+        st.error('선택한 사진 파일에 문제가 있습니다. ① 사진 등록 탭에서 세부 내용을 확인해 주세요.')
+    elif top_uploaded:
+        filename_line = ' · '.join(f.name for f in files_at_top)
+        st.caption(f'현재 선택된 파일: {filename_line[:240]}' + ('…' if len(filename_line) > 240 else ''))
+        if not top_recognized:
+            st.info('**사진 등록까지만 완료**되었습니다. ①에서 「AI 인식 시작」을 눌러야 데이터가 추출됩니다.')
+        else:
+            st.success('현재 사진의 AI 인식 결과가 준비되었습니다. ②에서 수치를 확인하고 저장해 주세요.')
+
+# 네 개의 작업 화면을 분리하여 필요한 정보에 집중할 수 있게 합니다.
+step_upload, step_review, step_plot, step_excel = st.tabs([
+    "① 사진 등록·AI 인식", "② 추출값 검토·저장", "③ 통합 출력선도", "④ 엑셀 다운로드"
+])
+
+with step_upload:
+    st.subheader("① 모터 모델명 입력 및 사양 이미지 등록")
+    st.caption("먼저 모터 모델명을 입력하세요. 그 다음 캡처 또는 사진 파일을 등록합니다. 권선절환 포인트를 입력하면 ③ 그래프와 ④ 엑셀 계산표가 즉시 같은 기준으로 갱신됩니다. 방법 A와 B를 함께 사용할 수 있습니다.")
+
+    st.text_input("모터 모델명 (사진 등록 전에 먼저 입력)", key="motor_name", placeholder="예: Bill 1128/20000B")
+    st.number_input("권선절환 포인트 RPM (입력 즉시 그래프/값 반영)", min_value=0, max_value=100000, step=100, key="switch_rpm_user", help="0이면 절환 미적용, 0보다 큰 값이면 LOW/HIGH 절환 적용 그래프와 값이 생성됩니다.")
+    capture_col, upload_col = st.columns(2, gap="large")
+    with capture_col:
+        st.markdown("#### 📋 A. 화면 캡처 붙여넣기")
+        st.markdown("**Windows:** `Win + Shift + S` → 모터 사양표 영역 드래그 → 아래 버튼 클릭")
+        st.caption("클립보드에 복사된 이미지를 바로 받아옵니다. 캡처 파일을 저장할 필요가 없습니다.")
+        paste_result = paste_image_button(
+            "📋 복사한 캡처 이미지 등록",
+            key=f"motor_clipboard_paste_button_{st.session_state.clipboard_button_version}",
+            errors="raise",
+        )
+        if paste_result.image_data is not None:
+            added, feedback = add_clipboard_image(paste_result.image_data)
+            st.session_state.clipboard_feedback = feedback
+            if added:
+                st.rerun()
+        if st.session_state.get("clipboard_feedback"):
+            st.caption(st.session_state.clipboard_feedback)
+        st.caption("Chrome 또는 Edge의 HTTPS 환경을 권장합니다. 브라우저가 요청하면 클립보드 읽기 권한을 허용하세요.")
+        pasted_count = len(st.session_state.clipboard_images)
+        if pasted_count:
+            st.success(f"캡처 {pasted_count}장 등록됨")
+            if st.button("캡처 등록 목록 비우기", key="clear_clipboard_images"):
+                st.session_state.clipboard_images = []
+                st.session_state.clipboard_button_version += 1  # Reset the component's stale paste result.
+                st.session_state.clipboard_feedback = "캡처 이미지 목록을 비웠습니다."
+                st.rerun()
+
+    with upload_col:
+        st.markdown("#### 📁 B. 사진 파일 업로드")
+        st.caption("컴퓨터에 저장된 JPG/JPEG/PNG 파일을 선택하거나 끌어다 놓으세요.")
+        uploads = st.file_uploader(
+            "모터 카탈로그 사진 파일 선택",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+            key="motor_catalog_images",
+            help="사진 등록 후 아래 AI 인식 버튼을 눌러야 수치가 분석됩니다.",
+        )
+        if uploads:
+            st.success(f"파일 {len(uploads)}장 업로드됨")
+
+    screenshots = list(uploads or []) + clipboard_files()
+    st.divider()
+    st.markdown("#### ✅ 실제 등록된 이미지 확인")
+    st.caption("아래 미리보기에 표시된 이미지가 AI가 분석할 사진입니다. 파일 업로드와 캡처 등록을 합쳐 인식합니다.")
+    upload_sig = fingerprint_uploads(screenshots)
+    uploads_info, upload_errors = file_audit(screenshots)
+    matched = bool(upload_sig and upload_sig == st.session_state.recognized_signature)
+    if not screenshots:
+        st.info("**사진 미등록** · 캡처 붙여넣기 버튼을 누르거나 사진 파일을 선택해 주세요.")
+    else:
+        if upload_errors:
+            st.error("파일을 선택했지만 처리할 수 없는 이미지가 있습니다.")
+            for error in upload_errors:
+                st.warning(error)
+        else:
+            st.success(f"**사진 등록 확인: {len(screenshots)}장** · 파일을 정상적으로 받았습니다.")
+            if matched:
+                st.success("**AI 분석 완료** · 현재 선택된 사진의 수치를 추출했습니다. ② 사양 검토·저장 탭을 확인하세요.")
+            else:
+                st.info("**AI 분석 대기** · 사진 등록만 완료되었습니다. 아래 'AI 인식 시작' 버튼을 눌러야 숫자를 읽습니다.")
+        st.dataframe(uploads_info, use_container_width=True, hide_index=True)
+        with st.expander(f"📷 등록 사진 미리보기 ({len(screenshots)}장)", expanded=True):
+            image_cols = st.columns(min(3, len(screenshots)))
+            for i, file in enumerate(screenshots):
+                with image_cols[i % len(image_cols)]:
+                    raw = file.getvalue()
+                    if raw.startswith(b"\x89PNG\r\n\x1a\n") or raw.startswith(b"\xff\xd8\xff"):
+                        st.image(raw, caption=file.name, use_container_width=True)
+                    else:
+                        st.error(f"이미지 열기 실패: {file.name}")
+        st.caption("※ 사진 파일 자체는 영구 저장되지 않습니다. 인식된 숫자는 ②에서 검토 후 저장할 수 있습니다.")
+
+    if screenshots and not matched and st.session_state.rows and st.session_state.recognized_signature:
+        st.warning("선택한 사진이 이전 분석 사진과 다릅니다. 아래 인식 버튼을 다시 눌러야 새 사진의 수치가 반영됩니다.")
+
+    recognize_label = "🔄 다시 인식하기" if matched else "🔎 사진에서 모터 사양 자동 인식 시작"
+    if st.button(recognize_label, type="primary", use_container_width=True,
+                 disabled=not screenshots or bool(upload_errors)):
+        if not api_key:
+            st.session_state.recognition_error = "Gemini API 키가 없습니다. 왼쪽 'AI 이미지 인식 설정' 또는 Streamlit Secrets에 GEMINI_API_KEY를 지정해 주세요."
+        else:
+            st.session_state.recognition_error = ""
+            try:
+                with st.status("이미지를 분석하고 있습니다…", expanded=True) as progress:
+                    st.write(f"1/3 · 업로드한 사진 {len(screenshots)}장 확인")
+                    st.write("2/3 · Gemini AI에서 RPM·출력·토크 표 추출")
+                    catalog = extract_images(screenshots, api_key, model)
+                    parsed, issues = tidy_rows(flatten(catalog))
+                    if not parsed:
+                        raise ValueError("인식 가능한 RPM / 출력 / 토크 값이 없습니다. 숫자가 보이는 표 사진을 사용해 주세요.")
+                    st.write(f"3/3 · {len(parsed)}개 기준점 · {len(group_rows(parsed))}개 운전곡선 분류 완료")
+                    progress.update(label="AI 사양 인식 완료", state="complete", expanded=False)
+                st.session_state.rows = parsed
+                detected_name = catalog.get("motor_name") or ""
+                if not st.session_state.motor_name:
+                    st.session_state.motor_name = detected_name
+                st.session_state.max_rpm = max(100, int(catalog.get("maximum_rpm") or max(x["RPM"] for x in parsed)))
+                st.session_state.notes = " / ".join(map(str, catalog.get("notes", [])))
+                st.session_state.record_id = new_id()
+                st.session_state.editor_version += 1
+                st.session_state.recognized_signature = upload_sig
+                st.session_state.recognition_report = {
+                    "files": [f.name for f in screenshots],
+                    "points": len(parsed),
+                    "curves": len(group_rows(parsed)),
+                    "warnings": issues,
+                    "at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                st.session_state.saved_signature = None
+                st.session_state.saved_message = ""
+                st.session_state.data_origin = "AI 인식"
+                reset_excel()
+                st.rerun()
+            except Exception as exc:
+                st.session_state.recognition_error = str(exc)
+    if st.session_state.recognition_error:
+        st.error(f"AI 인식 실패: {st.session_state.recognition_error}")
+    report = st.session_state.recognition_report
+    if report and matched:
+        st.markdown("##### 인식 결과 요약")
+        k1, k2, k3 = st.columns(3)
+        k1.metric("인식 기준점", f"{report['points']}개")
+        k2.metric("운전 곡선", f"{report['curves']}개")
+        k3.metric("등록 사진", f"{len(report['files'])}장")
+        st.caption(f"마지막 인식: {report['at']} · AI 인식 완료는 수치 검토나 저장 완료를 의미하지 않습니다.")
+        st.markdown('**사진에서 추출한 운전조건 (빠른 확인용)**')
+        extracted = group_rows(st.session_state.rows)
+        check_rows = []
+        for key in sorted(extracted, key=lambda k: (k[0] != 'LOW', k[0] != 'HIGH', display_rating_order(k[1]))):
+            pts = extracted[key]
+            p_values = [v['출력(kW)'] for v in pts if v['출력(kW)'] is not None]
+            t_values = [v['토크(N·m)'] for v in pts if v['토크(N·m)'] is not None]
+            check_rows.append({'권선': key[0], '운전조건': key[1], 'RPM 범위': f"{pts[0]['RPM']:g}~{pts[-1]['RPM']:g}",
+                               '기준점': len(pts), '최대 출력(kW)': max(p_values) if p_values else None,
+                               '최대 토크(N·m)': max(t_values) if t_values else None})
+        st.dataframe(check_rows, hide_index=True, use_container_width=True)
+        st.warning('AI가 인식한 값은 오독 가능성이 있습니다. 아래 ② 탭에서 원본 사진과 비교해 검토·저장해야 합니다.')
+        if report["warnings"]:
+            with st.expander(f"AI 수치 확인 필요 ({len(report['warnings'])}건)"):
+                for item in report["warnings"][:25]:
+                    st.warning(item)
+        if st.button("② 추출된 데이터 검토하러 가기", use_container_width=True):
+            st.info("바로 위의 **② 사양 검토·저장** 탭을 클릭하세요.")
+    st.divider()
+    shortcut1, shortcut2 = st.columns(2)
+    with shortcut1:
+        if st.button("예제 데이터로 기능 확인", use_container_width=True):
+            sample, note = make_sample()
+            st.session_state.rows = sample
+            st.session_state.motor_name = "LOW-HIGH 모터 예제"
+            st.session_state.switch_rpm_user = 4500
+            st.session_state.max_rpm = 20000
+            st.session_state.notes = note
+            st.session_state.record_id = new_id()
+            st.session_state.editor_version += 1
+            st.session_state.recognized_signature = None
+            st.session_state.recognition_report = None
+            st.session_state.recognition_error = ""
+            st.session_state.saved_signature = None
+            st.session_state.data_origin = "예제"
+            reset_excel()
+            st.rerun()
+    with shortcut2:
+        if st.button("빈 입력표로 시작", use_container_width=True):
+            st.session_state.rows = []
+            st.session_state.motor_name = ""
+            st.session_state.switch_rpm_user = 0
+            st.session_state.max_rpm = 20000
+            st.session_state.notes = ""
+            st.session_state.record_id = new_id()
+            st.session_state.editor_version += 1
+            st.session_state.recognized_signature = None
+            st.session_state.recognition_report = None
+            st.session_state.recognition_error = ""
+            st.session_state.saved_signature = None
+            st.session_state.data_origin = "수동 입력"
+            reset_excel()
+            st.rerun()
+
+with step_review:
+    st.subheader("② 인식된 모터 사양 확인 및 저장")
+    if screenshots:
+        with st.expander(f"📷 인식에 사용한 원본 이미지 다시 확인 ({len(screenshots)}장)", expanded=False):
+            st.caption("①에 등록된 원본과 아래 인식값을 비교하세요.")
+            reference_cols = st.columns(min(2, len(screenshots)))
+            for idx, reference_image in enumerate(screenshots):
+                with reference_cols[idx % len(reference_cols)]:
+                    image_bytes = reference_image.getvalue()
+                    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n") or image_bytes.startswith(b"\xff\xd8\xff"):
+                        st.image(image_bytes, caption=reference_image.name, use_container_width=True)
+    if st.session_state.data_origin == "AI 인식":
+        if matched:
+            st.success("현재 사진의 AI 인식 데이터입니다. 원본 사진과 비교 후 저장하세요.")
+        elif screenshots:
+            st.warning("현재 등록된 사진과 표시된 인식값이 다릅니다. ①에서 다시 인식하세요.")
+        else:
+            st.info("이전 AI 인식 데이터입니다. 필요하면 새 사진을 등록하여 다시 인식하세요.")
+    elif st.session_state.rows:
+        st.info(f"현재 데이터 출처: {st.session_state.data_origin}")
+    else:
+        st.info("① 사진 등록·인식에서 사진을 분석하거나 예제/수동 입력을 선택하세요.")
+
+    a, b = st.columns([1.25, 0.75])
+    with a:
+        model_name = st.text_input("모터 모델명", value=st.session_state.motor_name)
+    with b:
+        rpm_limit = st.number_input("최대 RPM (그래프/계산표)", min_value=100,
+                                    max_value=100000, value=int(st.session_state.max_rpm), step=100)
+    remark = st.text_area("기타 사양 및 참고사항", value=st.session_state.notes, height=75)
+    imported = st.file_uploader("저장해 둔 모터 사양 JSON 불러오기 (선택)", type=["json"], key="json_import")
+    if st.button("JSON 데이터 불러오기", disabled=imported is None):
+        try:
+            payload = json.loads(imported.getvalue().decode("utf-8-sig"))
+            use_record(payload)
+            st.session_state.recognized_signature = None
+            st.session_state.recognition_report = None
+            st.session_state.saved_signature = None
+            st.session_state.data_origin = "JSON 불러오기"
+            st.rerun()
+        except Exception as exc:
+            st.error(f"JSON 파일을 읽지 못했습니다: {exc}")
+
+    editable = st.session_state.rows or [
+        {"권선": "LOW", "운전조건": "S1 Cont.", "RPM": 0, "출력(kW)": 0.0, "토크(N·m)": None},
+        {"권선": "LOW", "운전조건": "S1 Cont.", "RPM": 1500, "출력(kW)": None, "토크(N·m)": None},
+    ]
+    st.caption("아래는 AI가 읽은 값입니다. 반드시 원본과 대조한 후 수정·저장하세요. 빈칸은 미확인 수치입니다.")
+    updated = st.data_editor(
+        editable, hide_index=True, num_rows="dynamic", use_container_width=True,
+        key=f"motor_editor_{st.session_state.editor_version}",
+        column_config={
+            "권선": st.column_config.TextColumn("권선 LOW/HIGH"),
+            "운전조건": st.column_config.TextColumn("운전조건 S1/S2/S3"),
+            "RPM": st.column_config.NumberColumn("RPM", min_value=0, format="%.1f"),
+            "출력(kW)": st.column_config.NumberColumn("출력 (kW)", min_value=0, format="%.3f"),
+            "토크(N·m)": st.column_config.NumberColumn("토크 (N·m)", min_value=0, format="%.3f"),
+        },
+    )
+    valid, warnings = tidy_rows(updated)
+    groups = group_rows(valid)
+    if valid:
+        st.markdown("##### 추출 조건별 검토 요약")
+        summary = []
+        for (winding, rating), points in sorted(groups.items(), key=lambda item: (item[0][0] != 'LOW', item[0][0] != 'HIGH', display_rating_order(item[0][1]))):
+            kw_values = [v["출력(kW)"] for v in points if v["출력(kW)"] is not None]
+            nm_values = [v["토크(N·m)"] for v in points if v["토크(N·m)"] is not None]
+            summary.append({"권선": winding, "운전조건": rating, "기준점 수": len(points),
+                            "최소 RPM": points[0]["RPM"], "최대 RPM": points[-1]["RPM"],
+                            "최대 출력(kW)": max(kw_values) if kw_values else None,
+                            "최대 토크(N·m)": max(nm_values) if nm_values else None})
+        st.dataframe(summary, hide_index=True, use_container_width=True)
+        st.caption(f"인식/입력값 {len(valid)}개 기준점 · {len(groups)}개 곡선")
+    if warnings:
+        with st.expander(f"⚠️ 검토할 데이터 ({len(warnings)}건)", expanded=True):
+            for warning in warnings[:30]:
+                st.warning(warning)
+    pending_sig = content_signature(valid, model_name, int(rpm_limit), remark) if valid else None
+    saved_current = bool(pending_sig and st.session_state.saved_signature == pending_sig)
+    stale_photo = bool(screenshots and st.session_state.recognized_signature
+                       and not matched and st.session_state.data_origin == "AI 인식")
+    if saved_current:
+        st.success(f"✅ **수치 저장 완료** · {st.session_state.saved_message}")
+    else:
+        st.info("**검토·저장 대기** · 아래 버튼을 눌러야 수정한 수치가 저장됩니다.")
+    save_col, json_col = st.columns(2)
+    with save_col:
+        if st.button("✅ 검토한 모터 사양 저장", type="primary", use_container_width=True,
+                     disabled=not valid or stale_photo):
+            try:
+                st.session_state.rows = valid
+                st.session_state.motor_name = model_name
+                st.session_state.max_rpm = int(rpm_limit)
+                st.session_state.notes = remark
+                st.session_state.editor_version += 1
+                payload, sync = commit_save(valid, model_name, int(rpm_limit), remark, st.session_state.record_id)
+                st.session_state.saved_signature = content_signature(valid, model_name, int(rpm_limit), remark)
+                st.session_state.saved_message = "서버에 JSON 저장됨 · " + sync
+                reset_excel()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"저장 실패: {exc}")
+    with json_col:
+        current_payload = record_payload(valid, model_name, int(rpm_limit), remark, st.session_state.record_id)
+        st.download_button("📥 모터 사양 JSON 백업", data=json.dumps(current_payload, ensure_ascii=False, indent=2),
+                           file_name=f"{slug(model_name)}_motor_spec.json", mime="application/json",
+                           use_container_width=True, disabled=not valid)
+    if stale_photo:
+        st.warning("사진이 변경되어 저장을 잠시 막았습니다. ①에서 새 사진을 인식하거나 빈 입력표/예제로 시작하세요.")
+
+with step_plot:
+    st.subheader("③ 출력·토크 통합 선도")
+    if not valid:
+        st.info("먼저 ①에서 사진을 등록하고 ②에서 데이터를 확인하세요.")
+    else:
+        if not saved_current:
+            st.warning("그래프는 현재 검토표의 수치로 그려집니다. 저장이 아직 완료되지 않았다면 ②에서 저장하세요.")
+        show_mode = st.radio("표시할 항목", ["출력 + 토크", "출력만", "토크만"], horizontal=True, index=0)
+        switch_enabled = st.checkbox("권선절환 포인트 적용", value=bool(st.session_state.switch_rpm_user > 0))
+        switch_rpm = st.number_input("권선절환 RPM", min_value=0, max_value=int(rpm_limit),
+                                     value=min(int(st.session_state.switch_rpm_user), int(rpm_limit)), step=100)
+        st.session_state.switch_rpm_user = int(switch_rpm) if switch_enabled else 0
+        apply_switch = bool(switch_enabled and switch_rpm > 0)
+        show_raw_points = st.checkbox("원본 기준점 점 표시", value=True)
+
+        fig = make_plot(valid, max_rpm=int(rpm_limit),
+                        show_power=show_mode != "토크만",
+                        show_torque=show_mode != "출력만",
+                        switch_rpm=int(switch_rpm) if apply_switch else None,
+                        apply_switch=apply_switch,
+                        show_raw_points=show_raw_points)
+        st.plotly_chart(fig, use_container_width=True)
+        if apply_switch:
+            st.caption("예시 이미지처럼 권선절환 RPM을 기준으로 LOW/HIGH 곡선을 자동 결합해 표시합니다. LOW 계열은 회색, HIGH 출력은 파란색, HIGH 토크는 빨간색으로 표시됩니다.")
+        else:
+            st.caption("권선절환 포인트가 없으면 LOW/HIGH 원본 곡선을 그대로 표시합니다. 색상은 예시 이미지 느낌에 맞춰 LOW는 회색, HIGH 출력은 파란색, HIGH 토크는 빨간색 계열입니다.")
+        st.download_button("그래프 HTML 다운로드", data=fig.to_html(include_plotlyjs=True, full_html=True),
+                           file_name=f"{slug(model_name)}_diagram.html", mime="text/html")
+
+        st.markdown("##### 권선절환 적용값 미리보기")
+        grouped_bucket = grouped_by_bucket(valid)
+        buckets = sorted({b for _, b in grouped_bucket}, key=bucket_order)
+        preview_rows = []
+        preview_grid = rpm_grid(valid, limit=int(rpm_limit), step=500, switch_rpm=int(switch_rpm) if apply_switch else None)[:80]
+        for rpm in preview_grid:
+            row = {"RPM": rpm}
+            for bucket in buckets:
+                label = bucket_display(bucket)
+                if apply_switch:
+                    kw, nm, src = calc_switched_at(grouped_bucket, bucket, rpm, int(switch_rpm))
+                    row[f"{label} 출력(kW)"] = round(kw, 3) if kw is not None else None
+                    row[f"{label} 토크(N·m)"] = round(nm, 3) if nm is not None else None
+                    row[f"{label} 적용권선"] = src
+                else:
+                    for winding in ["LOW", "HIGH"]:
+                        pts = grouped_bucket.get((winding, bucket))
+                        if pts:
+                            kw, nm = calc_at(pts, rpm)
+                            row[f"{winding} {label} 출력(kW)"] = round(kw, 3) if kw is not None else None
+                            row[f"{winding} {label} 토크(N·m)"] = round(nm, 3) if nm is not None else None
+            preview_rows.append(row)
+        st.dataframe(preview_rows, hide_index=True, use_container_width=True)
+
+with step_excel:
+    st.subheader("④ RPM별 계산표 및 엑셀 다운로드")
+    if not valid:
+        st.info("먼저 데이터를 입력한 후 엑셀을 생성할 수 있습니다.")
+    else:
+        st.caption("엑셀 시트: 통합 선도 / RPM 계산표 / 권선절환 적용값 / 기준점 입력 / 사용 안내")
+        st.success("**RPM 계산표 배열:** LOW 출력(S3 10%→15%→25%→S2→S1) → LOW 토크(같은 순서) → HIGH 출력 → HIGH 토크. 카탈로그에 없는 조건은 추가하지 않습니다.")
+        current_switch = int(st.session_state.switch_rpm_user or 0)
+        if current_switch > 0:
+            st.info(f"현재 권선절환 포인트: {current_switch} rpm · 엑셀의 [권선절환 적용값] 시트와 [통합 선도]에 즉시 반영됩니다.")
+        else:
+            st.info("권선절환 포인트가 0이므로 LOW/HIGH 원본 계산표 기준으로 엑셀이 생성됩니다.")
+        rpm_step = st.selectbox("RPM 계산 간격", [10, 25, 50, 100, 200, 500], index=3)
+        stamp = content_signature(valid, model_name, int(rpm_limit), remark) + f"|{rpm_step}|{current_switch}"
+        if st.session_state.get("excel_key") != stamp:
+            st.session_state.pop("excel_bytes", None)
+        if st.button("📊 엑셀 계산표 생성", type="primary", use_container_width=True):
+            try:
+                with st.spinner("엑셀 차트와 RPM 계산표를 생성하는 중입니다…"):
+                    st.session_state.excel_bytes = generate_excel(
+                        valid, model_name, max_rpm=int(rpm_limit), step=int(rpm_step),
+                        switch_rpm=current_switch if current_switch > 0 else None,
+                        notes=remark,
+                    )
+                    st.session_state.excel_key = stamp
+                st.success("엑셀 생성 완료 · 아래 다운로드 버튼으로 파일을 저장하세요.")
+            except Exception as exc:
+                st.error(f"엑셀 생성 실패: {exc}")
+        if st.session_state.get("excel_bytes"):
+            st.download_button("📥 주축 출력선도 엑셀 다운로드 (.xlsx)",
+                               data=st.session_state.excel_bytes,
+                               file_name=f"{slug(model_name)}_spindle_diagram.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               type="primary", use_container_width=True)
+        with st.expander("RPM 계산값 미리보기", expanded=False):
+            preview = []
+            winding_names = sorted({k[0] for k in groups}, key=lambda w: (w != 'LOW', w != 'HIGH', w))
+            for rpm in rpm_grid(valid, limit=int(rpm_limit), step=int(rpm_step), switch_rpm=current_switch if current_switch > 0 else None)[:200]:
+                line = {'RPM': rpm}
+                for winding in winding_names:
+                    keys = sorted((k for k in groups if k[0] == winding), key=lambda k: display_rating_order(k[1]))
+                    for quantity in ('출력(kW)', '토크(N·m)'):
+                        for key in keys:
+                            kw, nm = calc_at(groups[key], rpm)
+                            value = kw if quantity == '출력(kW)' else nm
+                            line[f'{winding} / {quantity} / {key[1]}'] = round(value, 3) if value is not None else None
+                preview.append(line)
+            st.dataframe(preview, hide_index=True, use_container_width=True)
+
